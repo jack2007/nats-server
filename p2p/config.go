@@ -16,6 +16,11 @@ type Config struct {
 	TURNURLs       []string
 	SecretFile     string
 	CredentialTTL  time.Duration
+	SysUsername    string
+	SysPassword    string
+	AgentAccount   string
+	AgentUsername  string
+	AgentPassword  string
 }
 
 func ValidateConfig(cfg Config) error {

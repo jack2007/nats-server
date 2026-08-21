@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,12 +13,13 @@ import (
 )
 
 const (
-	p2pQueueGroup   = "p2p"
-	subjectRegister = "$P2P.REGISTER"
-	subjectCreate   = "$P2P.CREATE"
-	subjectUnreg    = "$P2P.UNREGISTER"
-	headerP2PName   = "Nats-P2P-Name"
-	defaultConnID   = "conn-0"
+	p2pQueueGroup      = "p2p"
+	subjectRegister    = "$P2P.REGISTER"
+	subjectCreate      = "$P2P.CREATE"
+	subjectUnreg         = "$P2P.UNREGISTER"
+	subjectDisconnect    = "$SYS.ACCOUNT.*.DISCONNECT"
+	headerP2PName        = "Nats-P2P-Name"
+	defaultConnID        = "conn-0"
 )
 
 var errConnzUnavailable = errors.New("connz unavailable")
@@ -26,6 +28,7 @@ type Manager struct {
 	s      *server.Server
 	cfg    Config
 	nc     *nats.Conn
+	sysNC  *nats.Conn
 	table  *Table
 	secret []byte
 	now    func() time.Time
@@ -51,7 +54,11 @@ func StartManager(s *server.Server, cfg Config) (*Manager, error) {
 	if err := ValidateConfig(cfg); err != nil {
 		return nil, err
 	}
-	nc, err := nats.Connect("", nats.InProcessServer(s), nats.Name("p2p-manager"), nats.UseOldRequestStyle())
+	opts := []nats.Option{nats.InProcessServer(s), nats.Name("p2p-manager"), nats.UseOldRequestStyle()}
+	if cfg.AgentUsername != "" {
+		opts = append(opts, nats.UserInfo(cfg.AgentUsername, cfg.AgentPassword))
+	}
+	nc, err := nats.Connect("", opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +87,32 @@ func StartManager(s *server.Server, cfg Config) (*Manager, error) {
 		nc.Close()
 		return nil, err
 	}
+	if cfg.SysUsername != "" {
+		sysNC, err := nats.Connect("",
+			nats.InProcessServer(s),
+			nats.Name("p2p-manager-sys"),
+			nats.UserInfo(cfg.SysUsername, cfg.SysPassword),
+		)
+		if err != nil {
+			nc.Close()
+			return nil, err
+		}
+		m.sysNC = sysNC
+		if _, err := sysNC.Subscribe(subjectDisconnect, m.handleDisconnect); err != nil {
+			nc.Close()
+			sysNC.Close()
+			return nil, err
+		}
+		if err := sysNC.Flush(); err != nil {
+			nc.Close()
+			sysNC.Close()
+			return nil, err
+		}
+	}
 	if err := nc.Flush(); err != nil {
+		if m.sysNC != nil {
+			m.sysNC.Close()
+		}
 		nc.Close()
 		return nil, err
 	}
@@ -88,10 +120,15 @@ func StartManager(s *server.Server, cfg Config) (*Manager, error) {
 }
 
 func (m *Manager) Stop() {
-	if m == nil || m.nc == nil {
+	if m == nil {
 		return
 	}
-	_ = m.nc.Drain()
+	if m.sysNC != nil {
+		_ = m.sysNC.Drain()
+	}
+	if m.nc != nil {
+		_ = m.nc.Drain()
+	}
 }
 
 func (m *Manager) handleRegister(msg *nats.Msg) {
@@ -110,7 +147,7 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 		return
 	}
 
-	account := server.DEFAULT_GLOBAL_ACCOUNT
+	account := m.agentAccount()
 	inbox := "$P2P.NODE." + req.NodeKey
 
 	m.regMu.Lock()
@@ -167,7 +204,7 @@ func (m *Manager) handleCreate(msg *nats.Msg) {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
-	account := server.DEFAULT_GLOBAL_ACCOUNT
+	account := m.agentAccount()
 	if _, ok := m.table.Get(account, self); !ok {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
@@ -238,7 +275,7 @@ func (m *Manager) handleUnregister(msg *nats.Msg) {
 		_ = msg.Respond(EncodeError(ErrNameMismatch))
 		return
 	}
-	if !m.table.Release(server.DEFAULT_GLOBAL_ACCOUNT, req.NodeKey, req.NodeKey) {
+	if !m.table.Release(m.agentAccount(), req.NodeKey, req.NodeKey) {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
@@ -303,6 +340,41 @@ func (m *Manager) deleteBound(name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.bound, name)
+}
+
+func (m *Manager) agentAccount() string {
+	if m.cfg.AgentAccount != "" {
+		return m.cfg.AgentAccount
+	}
+	return server.DEFAULT_GLOBAL_ACCOUNT
+}
+
+func (m *Manager) handleDisconnect(msg *nats.Msg) {
+	parts := strings.Split(msg.Subject, ".")
+	if len(parts) < 4 {
+		return
+	}
+	account := parts[2]
+
+	var ev struct {
+		Client struct {
+			Name string `json:"name"`
+		} `json:"client"`
+	}
+	if err := json.Unmarshal(msg.Data, &ev); err != nil {
+		return
+	}
+	connName := ev.Client.Name
+	if connName == "" {
+		return
+	}
+
+	m.regMu.Lock()
+	released := m.table.Release(account, connName, connName)
+	m.regMu.Unlock()
+	if released {
+		m.deleteBound(connName)
+	}
 }
 
 func encodeRegisterOK(nodeKey, inbox string) []byte {
