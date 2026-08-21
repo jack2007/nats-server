@@ -250,3 +250,71 @@ func TestClusterConcurrentRegisterSameKey(t *testing.T) {
 		t.Fatalf("ok=%d in_use=%d (want 1 and 1)", ok, inUse)
 	}
 }
+
+func TestClusterPrepareFailureRetryNotFalseIdempotent(t *testing.T) {
+	_, sB, _, mB := startClusterManagers(t)
+	account := testAgentAccount
+
+	mB.peers.mu.Lock()
+	mB.peers.lastBeat["ghost-peer"] = mB.now()
+	mB.peers.mu.Unlock()
+
+	ncB := agentConnApp(t, sB, "retry-key")
+	failReq := nats.NewMsg("$P2P.REGISTER")
+	failReq.Header.Set("Nats-P2P-Name", "retry-key")
+	failReq.Data = registerBody("retry-key")
+	got, err := ncB.RequestMsg(failReq, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(got.Data, []byte(`node_key_in_use`)) {
+		t.Fatalf("first attempt should fail PREPARE: %s", got.Data)
+	}
+	if rec, ok := mB.table.Get(account, "retry-key"); ok && rec.ServerID == mB.serverID {
+		t.Fatal("failed PREPARE should not leave a local reservation")
+	}
+
+	got, err = ncB.RequestMsg(failReq, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(got.Data, []byte(`"ok":true`)) {
+		t.Fatalf("retry must not false-idempotent succeed while PREPARE still fails: %s", got.Data)
+	}
+	if !bytes.Contains(got.Data, []byte(`node_key_in_use`)) {
+		t.Fatalf("retry should fail again: %s", got.Data)
+	}
+}
+
+func TestClusterPrepareTimeoutRollsBackPeers(t *testing.T) {
+	_, sB, mA, mB := startClusterManagers(t)
+	account := testAgentAccount
+
+	mB.peers.mu.Lock()
+	mB.peers.lastBeat["ghost-peer"] = mB.now()
+	mB.peers.mu.Unlock()
+
+	ncB := agentConnApp(t, sB, "timeout-key")
+	msg := nats.NewMsg("$P2P.REGISTER")
+	msg.Header.Set("Nats-P2P-Name", "timeout-key")
+	msg.Data = registerBody("timeout-key")
+	got, err := ncB.RequestMsg(msg, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg = got
+	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
+		t.Fatalf("want in_use on PREPARE timeout, got %s", msg.Data)
+	}
+	if rec, ok := mB.table.Get(account, "timeout-key"); ok && rec.ServerID == mB.serverID {
+		t.Fatal("B should not retain a local PREPARE reservation after timeout rollback")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if rec, ok := mA.table.Get(account, "timeout-key"); !ok || rec.ServerID != mB.serverID {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("A should release B placeholder after timeout rollback")
+}

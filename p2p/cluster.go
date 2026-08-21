@@ -41,6 +41,7 @@ type releasePayload struct {
 	Account  string `json:"account"`
 	NodeKey  string `json:"node_key"`
 	ConnName string `json:"conn_name"`
+	ClaimID  string `json:"claim_id,omitempty"`
 }
 
 type beatPayload struct {
@@ -276,9 +277,24 @@ func (m *Manager) handleMgrRelease(msg *nats.Msg) {
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
 		return
 	}
+	m.releaseIfMatch(req)
+}
+
+func (m *Manager) releaseIfMatch(req releasePayload) bool {
 	m.regMu.Lock()
-	m.table.Release(req.Account, req.NodeKey, req.ConnName)
-	m.regMu.Unlock()
+	defer m.regMu.Unlock()
+
+	existing, ok := m.table.Get(req.Account, req.NodeKey)
+	if !ok {
+		return false
+	}
+	if req.ClaimID != "" && existing.ClaimID != req.ClaimID {
+		return false
+	}
+	if req.ConnName != "" && existing.ConnName != req.ConnName {
+		return false
+	}
+	return m.table.Release(req.Account, req.NodeKey, existing.ConnName)
 }
 
 func (m *Manager) clusterPreparePhase(account, nodeKey, claimID string, claimedAt int64) bool {
@@ -316,19 +332,33 @@ func (m *Manager) clusterPreparePhase(account, nodeKey, claimID string, claimedA
 	for okCount < need {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			m.clusterPrepareRollback(account, nodeKey, claimID)
 			return false
 		}
 		msg, err := sub.NextMsg(remaining)
 		if err != nil {
+			m.clusterPrepareRollback(account, nodeKey, claimID)
 			return false
 		}
 		var rep mgrBoolReply
 		if err := json.Unmarshal(msg.Data, &rep); err != nil || !rep.OK {
+			m.clusterPrepareRollback(account, nodeKey, claimID)
 			return false
 		}
 		okCount++
 	}
 	return true
+}
+
+func (m *Manager) clusterPrepareRollback(account, nodeKey, claimID string) {
+	req := releasePayload{
+		Account:  account,
+		NodeKey:  nodeKey,
+		ConnName: nodeKey,
+		ClaimID:  claimID,
+	}
+	m.releaseIfMatch(req)
+	m.publishRelease(account, nodeKey, nodeKey, claimID)
 }
 
 func (m *Manager) clusterCommitPhase(account, nodeKey string, rec Record) {
@@ -349,11 +379,12 @@ func (m *Manager) clusterCommitPhase(account, nodeKey string, rec Record) {
 	_ = m.nc.Publish(subjectMgrCommit, data)
 }
 
-func (m *Manager) publishRelease(account, nodeKey, connName string) {
+func (m *Manager) publishRelease(account, nodeKey, connName, claimID string) {
 	b, err := json.Marshal(releasePayload{
 		Account:  account,
 		NodeKey:  nodeKey,
 		ConnName: connName,
+		ClaimID:  claimID,
 	})
 	if err != nil {
 		return

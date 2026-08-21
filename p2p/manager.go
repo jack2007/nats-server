@@ -189,13 +189,20 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 			return
 		}
+		if _, bound := m.getBound(headerName); bound {
+			m.regMu.Unlock()
+			m.setBound(headerName, req.NodeKey)
+			_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
+			return
+		}
+		staleClaimID := existing.ClaimID
+		staleConn := existing.ConnName
+		m.table.Release(account, req.NodeKey, staleConn)
 		m.regMu.Unlock()
-		m.setBound(headerName, req.NodeKey)
-		_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
-		return
+		m.publishRelease(account, req.NodeKey, staleConn, staleClaimID)
+	} else {
+		m.regMu.Unlock()
 	}
-
-	m.regMu.Unlock()
 
 	claimID, err := newUUID()
 	if err != nil {
@@ -304,7 +311,7 @@ func (m *Manager) handleUnregister(msg *nats.Msg) {
 		return
 	}
 	m.deleteBound(headerName)
-	m.publishRelease(account, req.NodeKey, req.NodeKey)
+	m.publishRelease(account, req.NodeKey, req.NodeKey, "")
 	b, _ := json.Marshal(map[string]any{"ok": true})
 	_ = msg.Respond(b)
 }
@@ -399,7 +406,7 @@ func (m *Manager) handleDisconnect(msg *nats.Msg) {
 	m.regMu.Unlock()
 	if released {
 		m.deleteBound(connName)
-		m.publishRelease(account, connName, connName)
+		m.publishRelease(account, connName, connName, "")
 	}
 }
 
