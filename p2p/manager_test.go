@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 func requestP2P(t *testing.T, nc *nats.Conn, subject, name string, data []byte) *nats.Msg {
@@ -225,6 +227,101 @@ func TestUnregisterBeforeRegister(t *testing.T) {
 	msg := requestP2P(t, c, "$P2P.UNREGISTER", "solo", []byte(`{"node_key":"solo"}`))
 	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
 		t.Fatalf("%s", msg.Data)
+	}
+}
+
+func TestCreateDuringPrepareDoesNotInvite(t *testing.T) {
+	s, cfg := startEmbeddedWithAccounts(t)
+	m, err := StartManager(s, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	peer := agentConnApp(t, s, "peer-b")
+	if msg := requestP2P(t, peer, "$P2P.REGISTER", "peer-b", registerBody("peer-b")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
+		t.Fatalf("peer register: %s", msg.Data)
+	}
+
+	client := agentConnApp(t, s, "client-a")
+	account := testAgentAccount
+	if err := m.table.Claim(account, "client-a", Record{
+		ServerID:  m.serverID,
+		ConnName:  "client-a",
+		Inbox:     "$P2P.NODE.client-a",
+		ClaimID:   "pending-claim",
+		ClaimedAt: 1,
+		Committed: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"peer-b"}`))
+	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
+		t.Fatalf("CREATE during PREPARE should fail: %s", msg.Data)
+	}
+}
+
+func TestConnzAccountIsolation(t *testing.T) {
+	t.Helper()
+	sysAcc := server.NewAccount("SYS")
+	appAcc := server.NewAccount(testAgentAccount)
+	otherAcc := server.NewAccount("OTHER")
+	opts := &server.Options{
+		Host:          "127.0.0.1",
+		Port:          -1,
+		NoLog:         true,
+		NoSigs:        true,
+		JetStream:     false,
+		Accounts:      []*server.Account{sysAcc, appAcc, otherAcc},
+		SystemAccount: "SYS",
+		Users: []*server.User{
+			{Username: "sys", Password: "sys", Account: sysAcc},
+			{Username: "app", Password: "app", Account: appAcc},
+			{Username: "other", Password: "other", Account: otherAcc},
+		},
+	}
+	s, err := server.NewServer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Start()
+	if !s.ReadyForConnections(5 * time.Second) {
+		t.Fatal("not ready")
+	}
+	t.Cleanup(s.Shutdown)
+
+	cfg := Config{
+		STUNURLs:      []string{"stun:turn.example.com:3478"},
+		SysUsername:   "sys",
+		SysPassword:   "sys",
+		AgentAccount:  testAgentAccount,
+		AgentUsername: "app",
+		AgentPassword: "app",
+	}
+	m, err := StartManager(s, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	other, err := nats.Connect("", nats.InProcessServer(s), nats.UserInfo("other", "other"), nats.Name("shared-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	app := agentConnApp(t, s, "shared-key")
+
+	count, err := m.countConnsNamed("shared-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("count=%d want 1 (OTHER account conn must not count)", count)
+	}
+
+	if msg := requestP2P(t, app, "$P2P.REGISTER", "shared-key", registerBody("shared-key")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
+		t.Fatalf("register with same name on app account: %s", msg.Data)
 	}
 }
 

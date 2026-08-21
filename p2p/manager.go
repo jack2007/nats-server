@@ -248,7 +248,7 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 	m.clusterCommitPhase(account, req.NodeKey, rec)
 	m.regMu.Lock()
 	held, ok := m.table.Get(account, req.NodeKey)
-	stillOwner := ok && held.ClaimID == claimID
+	stillOwner := ok && held.ClaimID == claimID && held.Committed
 	m.regMu.Unlock()
 	if !stillOwner {
 		return
@@ -265,7 +265,7 @@ func (m *Manager) handleCreate(msg *nats.Msg) {
 	self, ok := m.getBound(headerName)
 	account := m.agentAccount()
 	if !ok {
-		if rec, exists := m.table.Get(account, headerName); exists {
+		if rec, exists := m.table.GetCommitted(account, headerName); exists {
 			if rec.ServerID != m.serverID {
 				return
 			}
@@ -292,7 +292,7 @@ func (m *Manager) handleCreate(msg *nats.Msg) {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
-	if _, ok := m.table.Get(account, self); !ok {
+	if _, ok := m.table.GetCommitted(account, self); !ok {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
@@ -310,7 +310,7 @@ func (m *Manager) handleCreate(msg *nats.Msg) {
 		_ = msg.Respond(EncodeError(ErrPeerIsSelf))
 		return
 	}
-	if _, ok := m.table.Get(account, req.PeerNodeKey); !ok {
+	if _, ok := m.table.GetCommitted(account, req.PeerNodeKey); !ok {
 		_ = msg.Respond(EncodeError(ErrPeerNotRegistered))
 		return
 	}
@@ -428,16 +428,17 @@ func (m *Manager) countConnsNamed(name string) (int, error) {
 	if m.countNamed != nil {
 		return m.countNamed(name)
 	}
+	account := m.agentAccount()
 	n := 0
 	offset := 0
 	for {
 		limit := server.DefaultConnListSize
-		cz, err := m.s.Connz(&server.ConnzOptions{Offset: offset, Limit: limit})
+		cz, err := m.s.Connz(&server.ConnzOptions{Offset: offset, Limit: limit, Account: account})
 		if err != nil {
 			return 0, err
 		}
 		if cz.Total > 0 && cz.Total > len(cz.Conns) && offset == 0 {
-			cz, err = m.s.Connz(&server.ConnzOptions{Offset: 0, Limit: cz.Total})
+			cz, err = m.s.Connz(&server.ConnzOptions{Offset: 0, Limit: cz.Total, Account: account})
 			if err != nil {
 				return 0, err
 			}

@@ -424,8 +424,19 @@ func TestClusterHeartbeatDropServerAllowsReregister(t *testing.T) {
 	}
 
 	mB.Stop()
+	sB.Shutdown()
 
 	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		if sA.NumRoutes() == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sA.NumRoutes() > 0 {
+		t.Fatalf("routes still up after B shutdown")
+	}
+
 	for time.Now().Before(deadline) {
 		if _, ok := mA.table.Get(account, key); !ok {
 			break

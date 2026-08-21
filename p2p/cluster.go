@@ -244,6 +244,7 @@ func (m *Manager) prepareAccept(req preparePayload) bool {
 			Inbox:     "$P2P.NODE." + req.NodeKey,
 			ClaimID:   req.ClaimID,
 			ClaimedAt: req.ClaimedAt,
+			Committed: false,
 		}
 		_ = m.table.Claim(req.Account, req.NodeKey, rec)
 		return true
@@ -258,6 +259,7 @@ func (m *Manager) prepareAccept(req preparePayload) bool {
 			Inbox:     "$P2P.NODE." + req.NodeKey,
 			ClaimID:   req.ClaimID,
 			ClaimedAt: req.ClaimedAt,
+			Committed: false,
 		}
 		m.table.Release(req.Account, req.NodeKey, existing.ConnName)
 		_ = m.table.Claim(req.Account, req.NodeKey, rec)
@@ -274,6 +276,9 @@ func (m *Manager) encodeMgrReply(ok bool) []byte {
 func (m *Manager) handleMgrCommit(msg *nats.Msg) {
 	var req commitPayload
 	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		if msg.Reply != "" {
+			_ = msg.Respond(m.encodeMgrReply(false))
+		}
 		return
 	}
 	rec := Record{
@@ -282,22 +287,28 @@ func (m *Manager) handleMgrCommit(msg *nats.Msg) {
 		Inbox:     req.Inbox,
 		ClaimID:   req.ClaimID,
 		ClaimedAt: req.ClaimedAt,
+		Committed: true,
 	}
 	m.applyCommit(req.Account, req.NodeKey, rec)
+	if msg.Reply != "" {
+		_ = msg.Respond(m.encodeMgrReply(true))
+	}
 }
 
 func (m *Manager) applyCommit(account, nodeKey string, rec Record) {
+	rec.Committed = true
 	m.regMu.Lock()
 	defer m.regMu.Unlock()
 
 	existing, ok := m.table.Get(account, nodeKey)
 	if ok {
 		if existing.ClaimID == rec.ClaimID {
+			existing.Committed = true
 			if rec.Inbox != "" {
 				existing.Inbox = rec.Inbox
 				existing.ConnName = rec.ConnName
-				_ = m.table.Claim(account, nodeKey, existing)
 			}
+			_ = m.table.Claim(account, nodeKey, existing)
 			return
 		}
 		if !claimWins(rec.ClaimedAt, rec.ServerID, existing.ClaimedAt, existing.ServerID) {
@@ -347,11 +358,15 @@ func (m *Manager) clusterPreparePhase(account, nodeKey, claimID string, claimedA
 	}
 
 	alive := m.peers.alive(m.now())
-	need := len(alive)
-	if need <= 1 && !m.inCluster() {
+	if !m.inCluster() && len(alive) <= 1 {
 		return m.prepareAccept(payload)
 	}
-	if need < 1 {
+	need := len(alive)
+	if m.inCluster() {
+		if need < 2 {
+			need = 2
+		}
+	} else if need < 1 {
 		need = 1
 	}
 
@@ -426,7 +441,45 @@ func (m *Manager) clusterCommitPhase(account, nodeKey string, rec Record) {
 	if err != nil {
 		return
 	}
-	_ = m.mgrConn().Publish(subjectMgrCommit, data)
+	nc := m.mgrConn()
+	if !m.inCluster() {
+		_ = nc.Publish(subjectMgrCommit, data)
+		return
+	}
+
+	inbox := nc.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		return
+	}
+	defer sub.Unsubscribe()
+
+	if err := nc.PublishRequest(subjectMgrCommit, inbox, data); err != nil {
+		return
+	}
+
+	alive := m.peers.alive(m.now())
+	need := len(alive)
+	if need < 2 {
+		need = 2
+	}
+	deadline := m.now().Add(clusterPrepareTimeout)
+	okCount := 0
+	for okCount < need {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		msg, err := sub.NextMsg(remaining)
+		if err != nil {
+			break
+		}
+		var rep mgrBoolReply
+		if err := json.Unmarshal(msg.Data, &rep); err != nil || !rep.OK {
+			break
+		}
+		okCount++
+	}
 }
 
 func (m *Manager) publishRelease(account, nodeKey, connName, claimID string) {

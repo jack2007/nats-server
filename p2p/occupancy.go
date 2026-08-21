@@ -13,6 +13,7 @@ type Record struct {
 	Inbox     string
 	ClaimID   string
 	ClaimedAt int64
+	Committed bool
 }
 
 type Table struct {
@@ -39,6 +40,7 @@ func (t *Table) Claim(account, nodeKey string, rec Record) error {
 		if existing.ConnName != rec.ConnName {
 			return ErrNodeKeyInUse
 		}
+		acc[nodeKey] = rec
 		return nil
 	}
 	acc[nodeKey] = rec
@@ -55,6 +57,14 @@ func (t *Table) Get(account, nodeKey string) (Record, bool) {
 	}
 	rec, ok := acc[nodeKey]
 	return rec, ok
+}
+
+func (t *Table) GetCommitted(account, nodeKey string) (Record, bool) {
+	rec, ok := t.Get(account, nodeKey)
+	if !ok || !rec.Committed {
+		return Record{}, false
+	}
+	return rec, true
 }
 
 func (t *Table) Release(account, nodeKey, connName string) bool {
