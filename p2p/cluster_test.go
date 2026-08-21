@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"testing"
@@ -317,4 +318,60 @@ func TestClusterPrepareTimeoutRollsBackPeers(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("A should release B placeholder after timeout rollback")
+}
+
+func TestClusterStaleDisconnectDoesNotDropNewOccupant(t *testing.T) {
+	sA, sB, mA, mB := startClusterManagers(t)
+	account := testAgentAccount
+	key := "shared-key"
+
+	ncA := agentConnApp(t, sA, key)
+	if msg := requestP2P(t, ncA, "$P2P.REGISTER", key, registerBody(key)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
+		t.Fatalf("A register: %s", msg.Data)
+	}
+	ncA.Close()
+
+	ncB := agentConnApp(t, sB, key)
+	deadline := time.Now().Add(10 * time.Second)
+	var registered bool
+	var last []byte
+	for time.Now().Before(deadline) {
+		msg := requestP2P(t, ncB, "$P2P.REGISTER", key, registerBody(key))
+		if bytes.Contains(msg.Data, []byte(`"ok":true`)) {
+			registered = true
+			break
+		}
+		last = msg.Data
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !registered {
+		t.Fatalf("B failed to register after A close, last=%s", last)
+	}
+
+	recB, ok := mA.table.Get(account, key)
+	if !ok || recB.ServerID != mB.serverID {
+		t.Fatalf("A table should show B owner before stale disconnect: %+v ok=%v", recB, ok)
+	}
+
+	ev, _ := json.Marshal(map[string]any{"client": map[string]string{"name": key}})
+	mA.handleDisconnect(&nats.Msg{
+		Subject: "$SYS.ACCOUNT." + account + ".DISCONNECT",
+		Data:    ev,
+	})
+
+	if rec, ok := mA.table.Get(account, key); !ok || rec.ClaimID != recB.ClaimID {
+		t.Fatalf("stale disconnect wiped A table: had=%+v now=%+v ok=%v", recB, rec, ok)
+	}
+	if rec, ok := mB.table.Get(account, key); !ok || rec.ClaimID != recB.ClaimID {
+		t.Fatalf("stale disconnect wiped B table: had=%+v now=%+v ok=%v", recB, rec, ok)
+	}
+
+	peer := agentConnApp(t, sA, "peer-node")
+	if msg := requestP2P(t, peer, "$P2P.REGISTER", "peer-node", registerBody("peer-node")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
+		t.Fatalf("peer register: %s", msg.Data)
+	}
+	got := requestP2P(t, ncB, "$P2P.CREATE", key, []byte(`{"peer_node_key":"peer-node"}`))
+	if !bytes.Contains(got.Data, []byte(`"ok":true`)) {
+		t.Fatalf("B CREATE after stale disconnect: %s", got.Data)
+	}
 }

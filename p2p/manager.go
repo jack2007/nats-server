@@ -327,12 +327,22 @@ func (m *Manager) handleUnregister(msg *nats.Msg) {
 		return
 	}
 	account := m.agentAccount()
-	if !m.table.Release(account, req.NodeKey, req.NodeKey) {
+	m.regMu.Lock()
+	existing, ok := m.table.Get(account, req.NodeKey)
+	if !ok || existing.ServerID != m.serverID {
+		m.regMu.Unlock()
+		_ = msg.Respond(EncodeError(ErrNotRegistered))
+		return
+	}
+	claimID := existing.ClaimID
+	released := m.table.Release(account, req.NodeKey, existing.ConnName)
+	m.regMu.Unlock()
+	if !released {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
 	m.deleteBound(headerName)
-	m.publishRelease(account, req.NodeKey, req.NodeKey, "")
+	m.publishRelease(account, req.NodeKey, req.NodeKey, claimID)
 	b, _ := json.Marshal(map[string]any{"ok": true})
 	_ = msg.Respond(b)
 }
@@ -423,11 +433,17 @@ func (m *Manager) handleDisconnect(msg *nats.Msg) {
 	}
 
 	m.regMu.Lock()
-	released := m.table.Release(account, connName, connName)
+	existing, ok := m.table.Get(account, connName)
+	if !ok || existing.ServerID != m.serverID {
+		m.regMu.Unlock()
+		return
+	}
+	claimID := existing.ClaimID
+	released := m.table.Release(account, connName, existing.ConnName)
 	m.regMu.Unlock()
 	if released {
 		m.deleteBound(connName)
-		m.publishRelease(account, connName, connName, "")
+		m.publishRelease(account, connName, connName, claimID)
 	}
 }
 
