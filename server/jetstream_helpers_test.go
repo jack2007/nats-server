@@ -183,6 +183,25 @@ var jsClusterTempl = `
 	accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
 `
 
+var jsClusterSyncAlwaysTempl = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 2GB, max_file_store: 2GB, store_dir: '%s', sync_interval: always}
+
+	leaf {
+		listen: 127.0.0.1:-1
+	}
+
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+
+	# For access to system account.
+	accounts { $SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] } }
+`
+
 var jsClusterEncryptedTempl = `
 	listen: 127.0.0.1:-1
 	server_name: %s
@@ -2403,4 +2422,17 @@ func performStreamRestore(t *testing.T, nc *nats.Conn, sc StreamConfig, ss Strea
 	_, err = nc.Request(res.DeliverSubject, nil, time.Second)
 	require_NoError(t, err)
 	return true
+}
+
+// publishAsync publishes a message asynchronously, retrying if we're stalled
+// on async publishes.
+func publishAsync(t testing.TB, js nats.JetStreamContext, subj string, msg []byte) nats.PubAckFuture {
+	t.Helper()
+	for {
+		pubAck, err := js.PublishAsync(subj, msg)
+		if err == nil {
+			return pubAck
+		}
+		require_Error(t, err, nats.ErrTooManyStalledMsgs)
+	}
 }

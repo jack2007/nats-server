@@ -11345,7 +11345,7 @@ func TestJetStreamConsumerAllowOverlappingSubjectsIfNotSubset(t *testing.T) {
 }
 
 func TestJetStreamConsumerResetToSequence(t *testing.T) {
-	test := func(replicas int) {
+	test := func(replicas int, ackPolicy AckPolicy) {
 		c := createJetStreamClusterExplicit(t, "R3S", 3)
 		defer c.shutdown()
 
@@ -11360,8 +11360,18 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 		_, err := js.AddStream(cfg)
 		require_NoError(t, err)
 
+		var ackOpt nats.SubOpt
+		switch ackPolicy {
+		case AckExplicit:
+			ackOpt = nats.AckExplicit()
+		case AckAll:
+			ackOpt = nats.AckAll()
+		default:
+			t.Fatalf("unsupported ack policy for this test: %v", ackPolicy)
+		}
 		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER",
 			nats.BindStream("TEST"),
+			ackOpt,
 			nats.MaxAckPending(1),
 			nats.AckWait(time.Second),
 			nats.ConsumerReplicas(replicas),
@@ -11448,6 +11458,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 2, adflr: 1,
 			sseq: 2, asflr: 1,
 		})
+		// Confirm the initial pending values.
+		o.mu.RLock()
+		npc, npf := o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 2)
+		require_Equal(t, npf, 0)
 
 		// Resetting the consumer with an empty request results in a reset back to the ack floor.
 		var resp JSApiConsumerResetResponse
@@ -11468,6 +11484,17 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 1, asflr: 1,
 		})
+		// AckAll can use the ack-floor fast path and leaves the floor as-is;
+		// AckExplicit always requires full recalculation here.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 3)
+		if ackPolicy == AckAll {
+			require_Equal(t, npf, 0)
+		} else {
+			require_Equal(t, npf, 4)
+		}
 
 		// Trying to reset to zero also resets back to the ack floor.
 		req := JSApiConsumerResetRequest{Seq: 0}
@@ -11490,6 +11517,16 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 1, asflr: 1,
 		})
+		// Same as above.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 3)
+		if ackPolicy == AckAll {
+			require_Equal(t, npf, 0)
+		} else {
+			require_Equal(t, npf, 4)
+		}
 
 		// Resetting the consumer to the last message's sequence so it can be delivered still.
 		req = JSApiConsumerResetRequest{Seq: 4}
@@ -11513,6 +11550,12 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 			dseq: 0, adflr: 0,
 			sseq: 3, asflr: 3,
 		})
+		// Confirm pending was recalculated.
+		o.mu.RLock()
+		npc, npf = o.npc, o.npf
+		o.mu.RUnlock()
+		require_Equal(t, npc, 1)
+		require_Equal(t, npf, 4)
 
 		// As a result of moving the starting sequence up, some messages
 		// have now lost interest and need to be removed.
@@ -11562,9 +11605,11 @@ func TestJetStreamConsumerResetToSequence(t *testing.T) {
 	}
 
 	for _, replicas := range []int{1, 3} {
-		t.Run(fmt.Sprintf("R%d", replicas), func(t *testing.T) {
-			test(replicas)
-		})
+		for _, ackPolicy := range []AckPolicy{AckExplicit, AckAll} {
+			t.Run(fmt.Sprintf("R%d/%s", replicas, ackPolicy), func(t *testing.T) {
+				test(replicas, ackPolicy)
+			})
+		}
 	}
 }
 
@@ -13110,5 +13155,87 @@ func TestJetStreamConsumerResetResponseAcrossServiceImport(t *testing.T) {
 			c.waitOnConsumerLeader("A", "TEST", "CONSUMER")
 			return c.consumerLeader("A", "TEST", "CONSUMER")
 		})
+	})
+}
+
+func TestJetStreamConsumerFlowControlResetOnLeaderChange(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST", Subjects: []string{"foo"}, Storage: nats.MemoryStorage,
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// A push consumer only delivers while there is interest on the deliver
+	// subject. We never read these, the subscription just keeps it active.
+	dsubj := "d.flowcontrol"
+	_, err = nc.Subscribe(dsubj, func(*nats.Msg) {})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	o, err := mset.addConsumer(&ConsumerConfig{
+		Durable:        "FC",
+		DeliverSubject: dsubj,
+		AckPolicy:      AckNone,
+		FlowControl:    true,
+		Heartbeat:      100 * time.Millisecond,
+	})
+	require_NoError(t, err)
+
+	state := func() (pbytes, maxpb int, fcid string, dseq uint64) {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		return o.pbytes, o.maxpb, o.fcid, o.dseq
+	}
+
+	// Open the window up to the ceiling a long lived consumer reaches on its own,
+	// by doubling in processFlowControl.
+	o.mu.Lock()
+	o.pblimit, o.maxpb = JsFlowControlMaxPending, JsFlowControlMaxPending
+	o.mu.Unlock()
+
+	// Above the post-reset window (limit/16) so delivery gates later, below the
+	// arming threshold (limit/2) so no flow control request goes out.
+	const target = JsFlowControlMaxPending / 8
+	payload := make([]byte, 256*1024)
+	for sent := 0; sent < target; sent += len(payload) {
+		_, err = js.Publish("foo", payload)
+		require_NoError(t, err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if pbytes, _, _, _ := state(); pbytes < target {
+			return fmt.Errorf("pbytes %d has not reached %d yet", pbytes, target)
+		}
+		return nil
+	})
+
+	// The state we expect to carry into the transition.
+	pbytes, maxpb, fcid, _ := state()
+	require_Equal(t, fcid, _EMPTY_)
+	require_Equal(t, maxpb, JsFlowControlMaxPending)
+	require_True(t, pbytes > JsFlowControlMaxPending/16)
+
+	// This is the sequence processConsumerLeaderChange runs.
+	require_NoError(t, o.setLeader(false, 0))
+	require_NoError(t, o.setLeader(true, 0))
+
+	pbytes, _, _, dseq := state()
+	require_Equal(t, pbytes, 0)
+
+	// And it must still deliver.
+	_, err = js.Publish("foo", []byte("hello"))
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if _, _, _, cur := state(); cur <= dseq {
+			return fmt.Errorf("consumer is not delivering, dseq stuck at %d", cur)
+		}
+		return nil
 	})
 }

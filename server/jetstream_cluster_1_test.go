@@ -11811,6 +11811,254 @@ func TestJetStreamClusterAsyncFlushBasics(t *testing.T) {
 	t.Run("SyncAlways", func(t *testing.T) { test(t, true) })
 }
 
+func TestJetStreamClusterFileStoreSyncOnFlushReplicaTransitions(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	for _, s := range c.servers {
+		s.optsMu.Lock()
+		s.opts.SyncAlways = true
+		s.optsMu.Unlock()
+	}
+
+	nc, _ := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  FileStorage,
+		Replicas: 3,
+	}
+	_, err := jsStreamCreate(t, nc, cfg)
+	require_NoError(t, err)
+
+	checkMode := func(expectSyncAlways, expectSyncOnFlush bool) {
+		t.Helper()
+		s := c.streamLeader(globalAccountName, cfg.Name)
+		mset, err := s.globalAccount().lookupStream(cfg.Name)
+		require_NoError(t, err)
+		fs := mset.Store().(*fileStore)
+		fs.mu.RLock()
+		configuredSyncAlways := fs.fcfg.SyncAlways
+		configuredSyncOnFlush := fs.fcfg.SyncOnFlush
+		fs.mu.RUnlock()
+		require_True(t, configuredSyncAlways)
+		require_True(t, configuredSyncOnFlush)
+		require_Equal(t, fs.syncAlways.Load(), expectSyncAlways)
+		require_Equal(t, fs.syncOnFlush.Load(), expectSyncOnFlush)
+	}
+
+	checkMode(false, true)
+
+	cfg.Replicas = 1
+	_, err = jsStreamUpdate(t, nc, cfg)
+	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, cfg.Name)
+	checkMode(true, false)
+	const numMsgs = 10
+	for range numMsgs {
+		sendStreamMsg(t, nc, "foo", "msg")
+	}
+
+	cfg.Replicas = 3
+	_, err = jsStreamUpdate(t, nc, cfg)
+	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, cfg.Name)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, cfg.Name)
+	})
+	checkMode(false, true)
+
+	s := c.streamLeader(globalAccountName, cfg.Name)
+	mset, err := s.globalAccount().lookupStream(cfg.Name)
+	require_NoError(t, err)
+	state := mset.state()
+	require_Equal(t, state.Msgs, numMsgs)
+	require_Equal(t, state.LastSeq, numMsgs)
+}
+
+func TestJetStreamClusterPrepareForWALReplayDoesNotAdvanceStore(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: nats.FileStorage})
+	require_NoError(t, err)
+	_, err = js.Publish("foo", []byte("one"))
+	require_NoError(t, err)
+
+	mset, err := s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_NoError(t, mset.prepareForWALReplay(&StreamReplicatedState{LastSeq: 2}))
+
+	state := mset.state()
+	require_Equal(t, state.Msgs, 1)
+	require_Equal(t, state.LastSeq, 1)
+	require_Equal(t, mset.lastSeq(), 1)
+}
+
+func TestJetStreamClusterWALReplayPreservesFirstSeq(t *testing.T) {
+	c := createJetStreamClusterWithTemplate(t, jsClusterSyncAlwaysTempl, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	const firstSeq = 1000
+	si, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Storage:  nats.FileStorage,
+		Replicas: 3,
+		FirstSeq: firstSeq,
+	})
+	require_NoError(t, err)
+	require_Equal(t, si.State.FirstSeq, firstSeq)
+	require_Equal(t, si.State.LastSeq, firstSeq-1)
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	// Restart a follower without allowing server shutdown to create its first
+	// snapshot. Its filestore must therefore be recovered from the complete WAL.
+	restartWithoutSnapshot := func(rs *Server) *Server {
+		t.Helper()
+		mset, err := rs.globalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		rn := mset.raftNode()
+		require_True(t, mset.shouldReplayFromWAL())
+		_, _, err = rn.LoadLastSnapshot()
+		require_Error(t, err, errNoSnapAvailable)
+
+		rn.Stop()
+		rn.WaitForStop()
+		rs.Shutdown()
+		rs.WaitForShutdown()
+		rs = c.restartServer(rs)
+		c.waitOnStreamCurrent(rs, globalAccountName, "TEST")
+		return rs
+	}
+
+	rs := c.randomNonStreamLeader(globalAccountName, "TEST")
+	require_NotNil(t, rs)
+	rs = restartWithoutSnapshot(rs)
+
+	// An empty stream has no WAL entry recording FirstSeq, so make sure recovery preserves it.
+	mset, err := rs.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_Equal(t, mset.state().Msgs, 0)
+	require_Equal(t, mset.state().FirstSeq, firstSeq)
+	require_Equal(t, mset.state().LastSeq, firstSeq-1)
+
+	// Repeat with an existing publish to exercise replay at FirstSeq as well.
+	pa, err := js.Publish("foo", []byte("one"))
+	require_NoError(t, err)
+	require_Equal(t, pa.Sequence, firstSeq)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
+
+	rs = restartWithoutSnapshot(rs)
+	mset, err = rs.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	require_Equal(t, mset.state().Msgs, 1)
+	require_Equal(t, mset.state().FirstSeq, firstSeq)
+	require_Equal(t, mset.state().LastSeq, firstSeq)
+
+	// The next publish must continue from the configured first sequence.
+	pa, err = js.Publish("foo", []byte("two"))
+	require_NoError(t, err)
+	require_Equal(t, pa.Sequence, firstSeq+1)
+}
+
+type snapshotlessRaftNode struct {
+	RaftNode
+	id string
+}
+
+func (n *snapshotlessRaftNode) ID() string                         { return n.id }
+func (n *snapshotlessRaftNode) Progress() (uint64, uint64, uint64) { return 1, 1, 0 }
+func (n *snapshotlessRaftNode) LoadLastSnapshot() (uint64, []byte, error) {
+	return 0, nil, errNoSnapAvailable
+}
+
+func TestJetStreamClusterPrepareForWALReplayPreservesR1ScaleUpSource(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: nats.FileStorage})
+	require_NoError(t, err)
+	for range 3 {
+		_, err = js.Publish("foo", []byte("msg"))
+		require_NoError(t, err)
+	}
+
+	mset, err := s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	fs := mset.store.(*fileStore)
+	fs.syncOnFlush.Store(true)
+
+	// Simulate the original R1 peer restarting before bootstrap completed.
+	const source = "source"
+	n := &snapshotlessRaftNode{id: source}
+	mset.mu.Lock()
+	mset.node = n
+	mset.sa = &streamAssignment{Group: &raftGroup{Desired: &desiredRaftGroup{
+		Peers: []string{source, "peer-2", "peer-3"},
+		Origin: &desiredRaftGroupOrigin{
+			Peers:    []string{source},
+			Replicas: 1,
+		},
+	}}}
+	mset.mu.Unlock()
+	defer func() {
+		mset.mu.Lock()
+		mset.node, mset.sa = nil, nil
+		mset.mu.Unlock()
+	}()
+
+	// Its new WAL cannot reconstruct the existing R1 stream state,
+	// prepareStreamRecovery must preserve the stream store
+	require_NoError(t, prepareStreamRecovery(mset, n))
+	state := mset.state()
+	require_Equal(t, state.Msgs, 3)
+	require_Equal(t, state.LastSeq, 3)
+}
+
+func TestJetStreamClusterPrepareForWALReplayTruncatesStore(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Storage: nats.FileStorage})
+	require_NoError(t, err)
+	for range 3 {
+		_, err = js.Publish("foo", []byte("msg"))
+		require_NoError(t, err)
+	}
+
+	mset, err := s.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	state := mset.state()
+	require_Equal(t, state.Msgs, 3)
+	require_Equal(t, state.LastSeq, 3)
+	require_Equal(t, mset.lastSeq(), 3)
+
+	require_NoError(t, mset.prepareForWALReplay(&StreamReplicatedState{LastSeq: 2}))
+
+	state = mset.state()
+	require_Equal(t, state.Msgs, 2)
+	require_Equal(t, state.LastSeq, 2)
+	require_Equal(t, mset.lastSeq(), 2)
+}
+
 func TestJetStreamClusterAsyncFlushFileStoreFlushOnSnapshot(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()

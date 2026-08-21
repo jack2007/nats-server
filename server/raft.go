@@ -41,6 +41,7 @@ type RaftNode interface {
 	Propose(term uint64, entry []byte) error
 	ProposeMulti(term uint64, entries []*Entry) error
 	ForwardProposal(entry []byte) error
+	LoadLastSnapshot() (uint64, []byte, error)
 	InstallSnapshot(snap []byte, force bool) error
 	CreateSnapshotCheckpoint(force bool) (RaftNodeCheckpoint, error)
 	SendSnapshot(snap []byte) error
@@ -1977,6 +1978,19 @@ func (n *raft) setupLastSnapshot() error {
 	}
 
 	return nil
+}
+
+func (n *raft) LoadLastSnapshot() (uint64, []byte, error) {
+	n.Lock()
+	defer n.Unlock()
+	snap, err := n.loadLastSnapshot()
+	if err != nil {
+		return 0, nil, err
+	}
+	if snap.lastIndex != n.papplied {
+		return 0, nil, errors.New("snapshot index mismatch")
+	}
+	return snap.lastIndex, snap.data, nil
 }
 
 // loadLastSnapshot will load and return our last snapshot.
@@ -4458,6 +4472,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			}
 			n.debug("Received append entry in candidate state from %q, converting to follower", ae.leader)
 			n.stepdownLocked(ae.leader)
+			n.updateLeadChange(false)
 		}
 	}
 
@@ -5740,6 +5755,14 @@ func (n *raft) switchToCandidate() {
 		// The election timer fired, so we've not heard from a leader. Clear it
 		// like campaigning would, or we'd keep reporting we have one and the
 		// upper layer could never recognize the group as stuck.
+		n.updateLeader(noLeader)
+		n.resetElect(minElectionTimeout)
+		return
+	}
+
+	// For managed groups the meta layer can assign us before the group leader has
+	// added us to the peer set. Do not campaign while we're not a member ourselves.
+	if n.managed && n.peers[n.id] == nil {
 		n.updateLeader(noLeader)
 		n.resetElect(minElectionTimeout)
 		return

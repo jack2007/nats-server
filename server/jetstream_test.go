@@ -21628,10 +21628,15 @@ func TestJetStreamMaxMsgsPerSubjectAndDeliverLastPerSubject(t *testing.T) {
 	resume := o.lss.resume
 	o.mu.RUnlock()
 
+	// The publishes above are randomly distributed, so it's possible that not every
+	// subject was published to. Use the skiplist length so we don't wait on messages
+	// that were never published.
+	expected := len(pending)
+
 	// Now fetch the messages from the consumer.
 	ps, err := js.PullSubscribe(_EMPTY_, _EMPTY_, nats.Bind("test", "test_consumer"))
 	require_NoError(t, err)
-	for range subjects {
+	for range expected {
 		msgs, err := ps.Fetch(1)
 		require_NoError(t, err)
 		for _, msg := range msgs {
@@ -26270,6 +26275,21 @@ func TestJetStreamSourceStreamRecreated(t *testing.T) {
 					return err
 				} else if n := mset.numConsumers(); n == 0 {
 					return errors.New("no sourcing consumer yet")
+				}
+				// The sourcing stream must also be subscribed on the deliver subject.
+				smset, err := lookupStreamOnLeader("SOURCE")
+				if err != nil {
+					return err
+				}
+				smset.mu.RLock()
+				defer smset.mu.RUnlock()
+				if len(smset.sources) == 0 {
+					return errors.New("no source info yet")
+				}
+				for iname, si := range smset.sources {
+					if si.sip || si.sub == nil {
+						return fmt.Errorf("source %q not wired up yet", iname)
+					}
 				}
 				return nil
 			})

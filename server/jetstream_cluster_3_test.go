@@ -7432,6 +7432,7 @@ func TestJetStreamClusterStreamScaleDownChangesRaftGroup(t *testing.T) {
 	cfg.Replicas = 3
 	_, err = js.UpdateStream(cfg)
 	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, "TEST")
 
 	// Wait for some time to let the servers catch each other up. Can't use equality checks here.
 	time.Sleep(500 * time.Millisecond)
@@ -9883,6 +9884,82 @@ func TestJetStreamClusterDurableStreamMirrorServerManaged(t *testing.T) {
 				test(t, replicas, retention)
 			})
 		}
+	}
+}
+
+func TestJetStreamDurableProbeShortCircuitsBackoff(t *testing.T) {
+	for _, mirror := range []bool{false, true} {
+		kind := "Source"
+		if mirror {
+			kind = "Mirror"
+		}
+		t.Run(kind, func(t *testing.T) {
+			// Make every request time out, so we always end up backing off.
+			owt := srcDurableConsumerWaitTime
+			srcDurableConsumerWaitTime = time.Nanosecond
+			defer func() { srcDurableConsumerWaitTime = owt }()
+
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, _ := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := jsStreamCreate(t, nc, &StreamConfig{
+				Name:     "O",
+				Subjects: []string{"foo"},
+				Storage:  FileStorage,
+			})
+			require_NoError(t, err)
+			_, err = jsConsumerCreate(t, nc, "O", ConsumerConfig{
+				Durable:        "C",
+				DeliverSubject: "d",
+				AckPolicy:      AckFlowControl,
+				Heartbeat:      time.Second,
+			}, false)
+			require_NoError(t, err)
+
+			cfg := &StreamConfig{Name: "S", Storage: FileStorage}
+			ss := &StreamSource{Name: "O", Consumer: &StreamConsumerSource{Name: "C", DeliverSubject: "d"}}
+			if mirror {
+				cfg.Mirror = ss
+			} else {
+				cfg.Sources = []*StreamSource{ss}
+			}
+			_, err = jsStreamCreate(t, nc, cfg)
+			require_NoError(t, err)
+
+			mset, err := s.globalAccount().lookupStream("S")
+			require_NoError(t, err)
+
+			// Mirrors and sources share the sourceInfo, and only one of the two is set,
+			// so the rest of the test does not need to care which we are.
+			lastReq := func() time.Time {
+				mset.mu.RLock()
+				defer mset.mu.RUnlock()
+				si := mset.mirror
+				for _, ss := range mset.sources {
+					si = ss
+				}
+				return si.lreq
+			}
+
+			// The consumer is alive and pushing at us, so the probe we put up on each
+			// timeout must keep cutting the backoff short, and must be put back up for
+			// the timeout after that. Without it the next request would be 10s out and
+			// climbing, with it we only wait out the retry throttle.
+			var requests int
+			last := lastReq()
+			checkFor(t, 8*time.Second, 50*time.Millisecond, func() error {
+				if lreq := lastReq(); lreq.After(last) {
+					requests, last = requests+1, lreq
+				}
+				if requests < 2 {
+					return fmt.Errorf("only %d requests, backoff is not being cut short", requests)
+				}
+				return nil
+			})
+		})
 	}
 }
 
@@ -14063,6 +14140,53 @@ func TestJetStreamClusterMetaReplicasInJsz(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamClusterPendingPeersReportedInClusterInfo(t *testing.T) {
+	js := &jetStream{srv: &Server{}}
+
+	peerInfo := func(ci *ClusterInfo, peer string) *PeerInfo {
+		t.Helper()
+		for _, pi := range ci.Replicas {
+			if pi.Peer == peer {
+				return pi
+			}
+		}
+		t.Fatalf("peer %q not reported in cluster info", peer)
+		return nil
+	}
+
+	// The assignment has scaled up to three peers, but only "a" has joined the
+	// Raft group so far. The peers that are only known from the assignment must
+	// be distinguishable from the one that's an actual peer of the group.
+	rg := &raftGroup{
+		Name:  "test",
+		Peers: []string{"a", "b", "c"},
+		node:  &raft{peers: map[string]*lps{"a": {}}},
+	}
+	ci := js.clusterInfo(rg)
+	require_Len(t, len(ci.Replicas), 3)
+	require_False(t, peerInfo(ci, "a").Pending)
+	require_True(t, peerInfo(ci, "b").Pending)
+	require_True(t, peerInfo(ci, "c").Pending)
+
+	// Once they've all joined the group nothing is pending anymore.
+	rg.node = &raft{peers: map[string]*lps{"a": {}, "b": {}, "c": {}}}
+	ci = js.clusterInfo(rg)
+	require_Len(t, len(ci.Replicas), 3)
+	for _, pi := range ci.Replicas {
+		require_False(t, pi.Pending)
+	}
+
+	// Without a Raft node we have no knowledge of group membership, so we can't
+	// claim any of the assigned peers are pending.
+	rg.node = nil
+	rg.Desired = &desiredRaftGroup{ID: "id", Cluster: "C1", Peers: []string{"a", "b", "c"}}
+	ci = js.clusterInfo(rg)
+	require_Len(t, len(ci.Replicas), 3)
+	for _, pi := range ci.Replicas {
+		require_False(t, pi.Pending)
+	}
 }
 
 func TestJetStreamClusterMigrationStatusReportedInClusterInfo(t *testing.T) {
