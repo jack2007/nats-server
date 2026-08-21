@@ -45,6 +45,7 @@ _testmain.go
 
 # bin
 nats-server
+nats-p2p-server
 gnatsd
 check
 
