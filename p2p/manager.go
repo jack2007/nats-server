@@ -227,8 +227,20 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 
 func (m *Manager) handleCreate(msg *nats.Msg) {
 	headerName := msg.Header.Get(headerP2PName)
+	if headerName == "" {
+		return
+	}
 	self, ok := m.getBound(headerName)
-	if !ok || headerName == "" {
+	if !ok {
+		count, err := m.countConnsNamed(headerName)
+		if count == 0 {
+			return
+		}
+		if err != nil {
+			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+			return
+		}
+		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
 	account := m.agentAccount()
@@ -303,6 +315,15 @@ func (m *Manager) handleUnregister(msg *nats.Msg) {
 		return
 	}
 	if _, ok := m.getBound(headerName); !ok {
+		count, err := m.countConnsNamed(headerName)
+		if count == 0 {
+			return
+		}
+		if err != nil {
+			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+			return
+		}
+		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
 	account := m.agentAccount()

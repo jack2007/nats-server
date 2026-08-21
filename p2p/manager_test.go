@@ -166,6 +166,34 @@ func TestRegisterConnzFailureIsNodeKeyInUse(t *testing.T) {
 	}
 }
 
+func TestCreateBeforeRegister(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	c := agentConn(t, s, "solo")
+	msg := requestP2P(t, c, "$P2P.CREATE", "solo", []byte(`{"peer_node_key":"other"}`))
+	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
+		t.Fatalf("%s", msg.Data)
+	}
+}
+
+func TestUnregisterBeforeRegister(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	c := agentConn(t, s, "solo")
+	msg := requestP2P(t, c, "$P2P.UNREGISTER", "solo", []byte(`{"node_key":"solo"}`))
+	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
+		t.Fatalf("%s", msg.Data)
+	}
+}
+
 func TestCreatePeerNotRegistered(t *testing.T) {
 	s := startEmbedded(t)
 	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
