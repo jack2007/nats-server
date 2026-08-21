@@ -13,7 +13,6 @@ import (
 )
 
 const (
-	p2pQueueGroup      = "p2p"
 	subjectRegister    = "$P2P.REGISTER"
 	subjectCreate      = "$P2P.CREATE"
 	subjectUnreg         = "$P2P.UNREGISTER"
@@ -25,17 +24,20 @@ const (
 var errConnzUnavailable = errors.New("connz unavailable")
 
 type Manager struct {
-	s      *server.Server
-	cfg    Config
-	nc     *nats.Conn
-	sysNC  *nats.Conn
-	table  *Table
-	secret []byte
-	now    func() time.Time
+	s        *server.Server
+	cfg      Config
+	nc       *nats.Conn
+	sysNC    *nats.Conn
+	table    *Table
+	secret   []byte
+	now      func() time.Time
+	serverID string
+	peers    *peerTracker
 
-	mu    sync.Mutex
-	regMu sync.Mutex
-	bound map[string]string
+	mu          sync.Mutex
+	regMu       sync.Mutex
+	bound       map[string]string
+	clusterStop chan struct{}
 
 	countNamed func(name string) (int, error)
 }
@@ -63,27 +65,28 @@ func StartManager(s *server.Server, cfg Config) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		s:     s,
-		cfg:   cfg,
-		nc:    nc,
-		table: NewTable(),
-		now:   time.Now,
-		bound: make(map[string]string),
+		s:        s,
+		cfg:      cfg,
+		nc:       nc,
+		table:    NewTable(),
+		now:      time.Now,
+		serverID: s.ID(),
+		bound:    make(map[string]string),
 	}
 	if cfg.SecretFile != "" {
 		if secret, err := LoadSecret(cfg.SecretFile); err == nil {
 			m.secret = secret
 		}
 	}
-	if _, err := nc.QueueSubscribe(subjectRegister, p2pQueueGroup, m.handleRegister); err != nil {
+	if _, err := nc.Subscribe(subjectRegister, m.handleRegister); err != nil {
 		nc.Close()
 		return nil, err
 	}
-	if _, err := nc.QueueSubscribe(subjectCreate, p2pQueueGroup, m.handleCreate); err != nil {
+	if _, err := nc.Subscribe(subjectCreate, m.handleCreate); err != nil {
 		nc.Close()
 		return nil, err
 	}
-	if _, err := nc.QueueSubscribe(subjectUnreg, p2pQueueGroup, m.handleUnregister); err != nil {
+	if _, err := nc.Subscribe(subjectUnreg, m.handleUnregister); err != nil {
 		nc.Close()
 		return nil, err
 	}
@@ -116,6 +119,14 @@ func StartManager(s *server.Server, cfg Config) (*Manager, error) {
 		nc.Close()
 		return nil, err
 	}
+	if err := m.startCluster(); err != nil {
+		m.stopCluster()
+		if m.sysNC != nil {
+			m.sysNC.Close()
+		}
+		nc.Close()
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -123,6 +134,7 @@ func (m *Manager) Stop() {
 	if m == nil {
 		return
 	}
+	m.stopCluster()
 	if m.sysNC != nil {
 		_ = m.sysNC.Drain()
 	}
@@ -152,47 +164,56 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 
 	m.regMu.Lock()
 	count, err := m.countConnsNamed(req.NodeKey)
-	if err != nil || count == 0 {
+	existing, claimed := m.table.Get(account, req.NodeKey)
+	if count == 0 {
+		if !claimed {
+			m.regMu.Unlock()
+			return
+		}
+		if err != nil {
+			m.regMu.Unlock()
+			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+			return
+		}
 		m.regMu.Unlock()
-		_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 		return
 	}
-	_, claimed := m.table.Get(account, req.NodeKey)
 	if count > 1 && claimed {
 		m.regMu.Unlock()
 		_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 		return
 	}
 	if claimed {
+		if existing.ServerID != m.serverID {
+			m.regMu.Unlock()
+			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+			return
+		}
 		m.regMu.Unlock()
 		m.setBound(headerName, req.NodeKey)
 		_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
 		return
 	}
 
+	m.regMu.Unlock()
+
 	claimID, err := newUUID()
 	if err != nil {
-		m.regMu.Unlock()
 		_ = msg.Respond(EncodeError(ErrInvalidRequest))
 		return
 	}
 	rec := Record{
-		ServerID:  m.s.ID(),
+		ServerID:  m.serverID,
 		ConnName:  req.NodeKey,
 		Inbox:     inbox,
 		ClaimID:   claimID,
 		ClaimedAt: m.now().UnixNano(),
 	}
-	if err := m.table.Claim(account, req.NodeKey, rec); err != nil {
-		m.regMu.Unlock()
-		if errors.Is(err, ErrNodeKeyInUse) {
-			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
-			return
-		}
-		_ = msg.Respond(EncodeError(ErrInvalidRequest))
+	if !m.clusterPreparePhase(account, req.NodeKey, claimID, rec.ClaimedAt) {
+		_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 		return
 	}
-	m.regMu.Unlock()
+	m.clusterCommitPhase(account, req.NodeKey, rec)
 	m.setBound(headerName, req.NodeKey)
 	_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
 }
@@ -201,7 +222,6 @@ func (m *Manager) handleCreate(msg *nats.Msg) {
 	headerName := msg.Header.Get(headerP2PName)
 	self, ok := m.getBound(headerName)
 	if !ok || headerName == "" {
-		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
 	account := m.agentAccount()
@@ -275,11 +295,16 @@ func (m *Manager) handleUnregister(msg *nats.Msg) {
 		_ = msg.Respond(EncodeError(ErrNameMismatch))
 		return
 	}
-	if !m.table.Release(m.agentAccount(), req.NodeKey, req.NodeKey) {
+	if _, ok := m.getBound(headerName); !ok {
+		return
+	}
+	account := m.agentAccount()
+	if !m.table.Release(account, req.NodeKey, req.NodeKey) {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
 	m.deleteBound(headerName)
+	m.publishRelease(account, req.NodeKey, req.NodeKey)
 	b, _ := json.Marshal(map[string]any{"ok": true})
 	_ = msg.Respond(b)
 }
@@ -374,6 +399,7 @@ func (m *Manager) handleDisconnect(msg *nats.Msg) {
 	m.regMu.Unlock()
 	if released {
 		m.deleteBound(connName)
+		m.publishRelease(account, connName, connName)
 	}
 }
 
