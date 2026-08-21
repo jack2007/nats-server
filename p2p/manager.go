@@ -20,6 +20,8 @@ const (
 	defaultConnID   = "conn-0"
 )
 
+var errConnzUnavailable = errors.New("connz unavailable")
+
 type Manager struct {
 	s      *server.Server
 	cfg    Config
@@ -29,7 +31,10 @@ type Manager struct {
 	now    func() time.Time
 
 	mu    sync.Mutex
+	regMu sync.Mutex
 	bound map[string]string
+
+	countNamed func(name string) (int, error)
 }
 
 type createReply struct {
@@ -107,11 +112,22 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 
 	account := server.DEFAULT_GLOBAL_ACCOUNT
 	inbox := "$P2P.NODE." + req.NodeKey
-	if _, ok := m.table.Get(account, req.NodeKey); ok {
-		if m.connsNamed(req.NodeKey) > 1 {
-			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
-			return
-		}
+
+	m.regMu.Lock()
+	count, err := m.countConnsNamed(req.NodeKey)
+	if err != nil || count == 0 {
+		m.regMu.Unlock()
+		_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+		return
+	}
+	_, claimed := m.table.Get(account, req.NodeKey)
+	if count > 1 && claimed {
+		m.regMu.Unlock()
+		_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+		return
+	}
+	if claimed {
+		m.regMu.Unlock()
 		m.setBound(headerName, req.NodeKey)
 		_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
 		return
@@ -119,6 +135,7 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 
 	claimID, err := newUUID()
 	if err != nil {
+		m.regMu.Unlock()
 		_ = msg.Respond(EncodeError(ErrInvalidRequest))
 		return
 	}
@@ -130,6 +147,7 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 		ClaimedAt: m.now().UnixNano(),
 	}
 	if err := m.table.Claim(account, req.NodeKey, rec); err != nil {
+		m.regMu.Unlock()
 		if errors.Is(err, ErrNodeKeyInUse) {
 			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 			return
@@ -137,6 +155,7 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 		_ = msg.Respond(EncodeError(ErrInvalidRequest))
 		return
 	}
+	m.regMu.Unlock()
 	m.setBound(headerName, req.NodeKey)
 	_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
 }
@@ -247,10 +266,16 @@ func (m *Manager) issueTurn(sessionID, connectionID string, epoch uint64) *TurnC
 	}
 }
 
-func (m *Manager) connsNamed(name string) int {
+func (m *Manager) countConnsNamed(name string) (int, error) {
+	if m.countNamed != nil {
+		return m.countNamed(name)
+	}
 	cz, err := m.s.Connz(&server.ConnzOptions{Limit: server.DefaultConnListSize})
 	if err != nil {
-		return 0
+		return 0, err
+	}
+	if cz.Total > len(cz.Conns) {
+		return 0, errConnzUnavailable
 	}
 	n := 0
 	for _, c := range cz.Conns {
@@ -258,7 +283,7 @@ func (m *Manager) connsNamed(name string) int {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
 func (m *Manager) setBound(name, nodeKey string) {

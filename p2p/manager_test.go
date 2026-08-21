@@ -97,6 +97,75 @@ func TestRegisterCreateInviteSingleNode(t *testing.T) {
 	}
 }
 
+func TestRegisterConcurrentSameNameOneWins(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	a := agentConn(t, s, "shared-key")
+	b, err := nats.Connect("", nats.InProcessServer(s), nats.Name("shared-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	start := make(chan struct{})
+	results := make(chan []byte, 2)
+	for _, nc := range []*nats.Conn{a, b} {
+		go func(nc *nats.Conn) {
+			<-start
+			msg := nats.NewMsg("$P2P.REGISTER")
+			msg.Header.Set("Nats-P2P-Name", "shared-key")
+			msg.Data = []byte(`{"node_key":"shared-key"}`)
+			got, err := nc.RequestMsg(msg, time.Second)
+			if err != nil {
+				results <- []byte(err.Error())
+				return
+			}
+			results <- got.Data
+		}(nc)
+	}
+	close(start)
+	ok, inUse := 0, 0
+	for i := 0; i < 2; i++ {
+		data := <-results
+		switch {
+		case bytes.Contains(data, []byte(`"ok":true`)):
+			ok++
+		case bytes.Contains(data, []byte(`node_key_in_use`)):
+			inUse++
+		default:
+			t.Fatalf("unexpected: %s", data)
+		}
+	}
+	if ok != 1 || inUse != 1 {
+		t.Fatalf("ok=%d in_use=%d (want 1 and 1)", ok, inUse)
+	}
+}
+
+func TestRegisterConnzFailureIsNodeKeyInUse(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	c := agentConn(t, s, "solo")
+	if msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
+		t.Fatalf("%s", msg.Data)
+	}
+	m.countNamed = func(string) (int, error) {
+		return 0, errConnzUnavailable
+	}
+	msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`))
+	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
+		t.Fatalf("want node_key_in_use on connz failure, got %s", msg.Data)
+	}
+}
+
 func TestCreatePeerNotRegistered(t *testing.T) {
 	s := startEmbedded(t)
 	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
