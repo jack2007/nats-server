@@ -87,6 +87,17 @@ func (p *peerTracker) alive(now time.Time) []string {
 	return ids
 }
 
+func (p *peerTracker) knownOthers() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id := range p.lastBeat {
+		if id != p.selfID {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *peerTracker) prune(now time.Time) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -111,27 +122,54 @@ func claimWins(atA int64, idA string, atB int64, idB string) bool {
 	return idA < idB
 }
 
+func (m *Manager) mgrConn() *nats.Conn {
+	if m.sysNC != nil {
+		return m.sysNC
+	}
+	return m.nc
+}
+
+func (m *Manager) inCluster() bool {
+	if m.s != nil && m.s.NumRoutes() > 0 {
+		return true
+	}
+	return m.peers != nil && m.peers.knownOthers()
+}
+
 func (m *Manager) startCluster() error {
 	m.peers = newPeerTracker(m.serverID)
 	m.peers.note(m.serverID, m.now())
 
-	if _, err := m.nc.Subscribe(subjectMgrPrepare, m.handleMgrPrepare); err != nil {
+	nc := m.mgrConn()
+	if _, err := nc.Subscribe(subjectMgrPrepare, m.handleMgrPrepare); err != nil {
 		return err
 	}
-	if _, err := m.nc.Subscribe(subjectMgrCommit, m.handleMgrCommit); err != nil {
+	if _, err := nc.Subscribe(subjectMgrCommit, m.handleMgrCommit); err != nil {
 		return err
 	}
-	if _, err := m.nc.Subscribe(subjectMgrRelease, m.handleMgrRelease); err != nil {
+	if _, err := nc.Subscribe(subjectMgrRelease, m.handleMgrRelease); err != nil {
 		return err
 	}
-	if _, err := m.nc.Subscribe(subjectMgrBeat, m.handleMgrBeat); err != nil {
+	if _, err := nc.Subscribe(subjectMgrBeat, m.handleMgrBeat); err != nil {
+		return err
+	}
+	if err := nc.Flush(); err != nil {
 		return err
 	}
 
 	m.clusterStop = make(chan struct{})
+	m.publishBeat()
 	go m.clusterBeatLoop()
 	go m.clusterPruneLoop()
 	return nil
+}
+
+func (m *Manager) publishBeat() {
+	if m.peers != nil {
+		m.peers.note(m.serverID, m.now())
+	}
+	b, _ := json.Marshal(beatPayload{ServerID: m.serverID})
+	_ = m.mgrConn().Publish(subjectMgrBeat, b)
 }
 
 func (m *Manager) stopCluster() {
@@ -148,10 +186,8 @@ func (m *Manager) clusterBeatLoop() {
 		select {
 		case <-m.clusterStop:
 			return
-		case now := <-ticker.C:
-			m.peers.note(m.serverID, now)
-			b, _ := json.Marshal(beatPayload{ServerID: m.serverID})
-			_ = m.nc.Publish(subjectMgrBeat, b)
+		case <-ticker.C:
+			m.publishBeat()
 		}
 	}
 }
@@ -311,41 +347,55 @@ func (m *Manager) clusterPreparePhase(account, nodeKey, claimID string, claimedA
 	}
 
 	alive := m.peers.alive(m.now())
-	if len(alive) <= 1 {
+	need := len(alive)
+	if need <= 1 && !m.inCluster() {
 		return m.prepareAccept(payload)
 	}
+	if need < 1 {
+		need = 1
+	}
 
-	inbox := m.nc.NewInbox()
-	sub, err := m.nc.SubscribeSync(inbox)
+	nc := m.mgrConn()
+	inbox := nc.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
 	if err != nil {
 		return false
 	}
 	defer sub.Unsubscribe()
 
-	if err := m.nc.PublishRequest(subjectMgrPrepare, inbox, data); err != nil {
+	if err := nc.PublishRequest(subjectMgrPrepare, inbox, data); err != nil {
 		return false
 	}
 
-	need := len(alive)
 	deadline := m.now().Add(clusterPrepareTimeout)
 	okCount := 0
-	for okCount < need {
+	gotNACK := false
+	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			m.clusterPrepareRollback(account, nodeKey, claimID)
-			return false
+			break
 		}
-		msg, err := sub.NextMsg(remaining)
+		wait := remaining
+		if okCount >= need {
+			wait = 25 * time.Millisecond
+			if wait > remaining {
+				wait = remaining
+			}
+		}
+		msg, err := sub.NextMsg(wait)
 		if err != nil {
-			m.clusterPrepareRollback(account, nodeKey, claimID)
-			return false
+			break
 		}
 		var rep mgrBoolReply
 		if err := json.Unmarshal(msg.Data, &rep); err != nil || !rep.OK {
-			m.clusterPrepareRollback(account, nodeKey, claimID)
-			return false
+			gotNACK = true
+			break
 		}
 		okCount++
+	}
+	if gotNACK || okCount < need {
+		m.clusterPrepareRollback(account, nodeKey, claimID)
+		return false
 	}
 	return true
 }
@@ -376,7 +426,7 @@ func (m *Manager) clusterCommitPhase(account, nodeKey string, rec Record) {
 	if err != nil {
 		return
 	}
-	_ = m.nc.Publish(subjectMgrCommit, data)
+	_ = m.mgrConn().Publish(subjectMgrCommit, data)
 }
 
 func (m *Manager) publishRelease(account, nodeKey, connName, claimID string) {
@@ -389,5 +439,5 @@ func (m *Manager) publishRelease(account, nodeKey, connName, claimID string) {
 	if err != nil {
 		return
 	}
-	_ = m.nc.Publish(subjectMgrRelease, b)
+	_ = m.mgrConn().Publish(subjectMgrRelease, b)
 }

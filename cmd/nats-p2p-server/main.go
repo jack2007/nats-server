@@ -36,6 +36,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if has {
+		if err := p2p.ValidateConfig(pcfg); err != nil {
+			log.Fatal(err)
+		}
+	}
 	s, err := server.NewServer(opts)
 	if err != nil {
 		log.Fatal(err)
@@ -45,9 +50,6 @@ func main() {
 		log.Fatal("nats-server not ready")
 	}
 	if has {
-		if err := p2p.ValidateConfig(pcfg); err != nil {
-			log.Fatal(err)
-		}
 		m, err := p2p.StartManager(s, pcfg)
 		if err != nil {
 			log.Fatal(err)

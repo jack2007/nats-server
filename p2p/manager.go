@@ -13,12 +13,12 @@ import (
 )
 
 const (
-	subjectRegister    = "$P2P.REGISTER"
-	subjectCreate      = "$P2P.CREATE"
-	subjectUnreg         = "$P2P.UNREGISTER"
-	subjectDisconnect    = "$SYS.ACCOUNT.*.DISCONNECT"
-	headerP2PName        = "Nats-P2P-Name"
-	defaultConnID        = "conn-0"
+	subjectRegister   = "$P2P.REGISTER"
+	subjectCreate     = "$P2P.CREATE"
+	subjectUnreg      = "$P2P.UNREGISTER"
+	subjectDisconnect = "$SYS.ACCOUNT.*.DISCONNECT"
+	headerP2PName     = "Nats-P2P-Name"
+	defaultConnID     = "conn-0"
 )
 
 var errConnzUnavailable = errors.New("connz unavailable")
@@ -36,6 +36,7 @@ type Manager struct {
 
 	mu          sync.Mutex
 	regMu       sync.Mutex
+	keyMu       sync.Map
 	bound       map[string]string
 	clusterStop chan struct{}
 
@@ -159,6 +160,9 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 		return
 	}
 
+	unlockKey := m.lockNodeKey(req.NodeKey)
+	defer unlockKey()
+
 	account := m.agentAccount()
 	inbox := "$P2P.NODE." + req.NodeKey
 
@@ -166,16 +170,14 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 	count, err := m.countConnsNamed(req.NodeKey)
 	existing, claimed := m.table.Get(account, req.NodeKey)
 	if count == 0 {
-		if !claimed {
-			m.regMu.Unlock()
-			return
-		}
+		m.regMu.Unlock()
 		if err != nil {
-			m.regMu.Unlock()
 			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 			return
 		}
-		m.regMu.Unlock()
+		if !claimed && !m.inCluster() {
+			_ = msg.Respond(EncodeError(ErrNameMismatch))
+		}
 		return
 	}
 	if count > 1 && claimed {
@@ -186,11 +188,22 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 	if claimed {
 		if existing.ServerID != m.serverID {
 			m.regMu.Unlock()
+			if !m.inCluster() {
+				_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+			}
+			return
+		}
+		if err != nil {
+			m.regMu.Unlock()
 			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 			return
 		}
 		if _, bound := m.getBound(headerName); bound {
 			m.regMu.Unlock()
+			if m.inCluster() {
+				_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+				return
+			}
 			m.setBound(headerName, req.NodeKey)
 			_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
 			return
@@ -217,10 +230,29 @@ func (m *Manager) handleRegister(msg *nats.Msg) {
 		ClaimedAt: m.now().UnixNano(),
 	}
 	if !m.clusterPreparePhase(account, req.NodeKey, claimID, rec.ClaimedAt) {
+		if m.inCluster() {
+			deadline := time.Now().Add(clusterPrepareTimeout)
+			for time.Now().Before(deadline) {
+				m.regMu.Lock()
+				held, ok := m.table.Get(account, req.NodeKey)
+				m.regMu.Unlock()
+				if ok && held.ClaimID != claimID {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
 		_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
 		return
 	}
 	m.clusterCommitPhase(account, req.NodeKey, rec)
+	m.regMu.Lock()
+	held, ok := m.table.Get(account, req.NodeKey)
+	stillOwner := ok && held.ClaimID == claimID
+	m.regMu.Unlock()
+	if !stillOwner {
+		return
+	}
 	m.setBound(headerName, req.NodeKey)
 	_ = msg.Respond(encodeRegisterOK(req.NodeKey, inbox))
 }
@@ -231,19 +263,35 @@ func (m *Manager) handleCreate(msg *nats.Msg) {
 		return
 	}
 	self, ok := m.getBound(headerName)
+	account := m.agentAccount()
+	if !ok {
+		if rec, exists := m.table.Get(account, headerName); exists {
+			if rec.ServerID != m.serverID {
+				return
+			}
+			self = rec.ConnName
+			if self == "" {
+				self = headerName
+			}
+			ok = true
+		}
+	}
 	if !ok {
 		count, err := m.countConnsNamed(headerName)
-		if count == 0 {
-			return
-		}
 		if err != nil {
 			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+			return
+		}
+		if count == 0 {
+			if m.inCluster() {
+				return
+			}
+			_ = msg.Respond(EncodeError(ErrNotRegistered))
 			return
 		}
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
 	}
-	account := m.agentAccount()
 	if _, ok := m.table.Get(account, self); !ok {
 		_ = msg.Respond(EncodeError(ErrNotRegistered))
 		return
@@ -315,16 +363,26 @@ func (m *Manager) handleUnregister(msg *nats.Msg) {
 		return
 	}
 	if _, ok := m.getBound(headerName); !ok {
-		count, err := m.countConnsNamed(headerName)
-		if count == 0 {
+		if rec, exists := m.table.Get(m.agentAccount(), req.NodeKey); exists {
+			if rec.ServerID != m.serverID {
+				return
+			}
+		} else {
+			count, err := m.countConnsNamed(headerName)
+			if err != nil {
+				_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
+				return
+			}
+			if count == 0 {
+				if m.inCluster() {
+					return
+				}
+				_ = msg.Respond(EncodeError(ErrNotRegistered))
+				return
+			}
+			_ = msg.Respond(EncodeError(ErrNotRegistered))
 			return
 		}
-		if err != nil {
-			_ = msg.Respond(EncodeError(CodeNodeKeyInUse))
-			return
-		}
-		_ = msg.Respond(EncodeError(ErrNotRegistered))
-		return
 	}
 	account := m.agentAccount()
 	m.regMu.Lock()
@@ -370,20 +428,37 @@ func (m *Manager) countConnsNamed(name string) (int, error) {
 	if m.countNamed != nil {
 		return m.countNamed(name)
 	}
-	cz, err := m.s.Connz(&server.ConnzOptions{Limit: server.DefaultConnListSize})
-	if err != nil {
-		return 0, err
-	}
-	if cz.Total > len(cz.Conns) {
-		return 0, errConnzUnavailable
-	}
 	n := 0
-	for _, c := range cz.Conns {
-		if c.Name == name {
-			n++
+	offset := 0
+	for {
+		limit := server.DefaultConnListSize
+		cz, err := m.s.Connz(&server.ConnzOptions{Offset: offset, Limit: limit})
+		if err != nil {
+			return 0, err
 		}
+		if cz.Total > 0 && cz.Total > len(cz.Conns) && offset == 0 {
+			cz, err = m.s.Connz(&server.ConnzOptions{Offset: 0, Limit: cz.Total})
+			if err != nil {
+				return 0, err
+			}
+			n = 0
+			for _, c := range cz.Conns {
+				if c.Name == name {
+					n++
+				}
+			}
+			return n, nil
+		}
+		for _, c := range cz.Conns {
+			if c.Name == name {
+				n++
+			}
+		}
+		if len(cz.Conns) == 0 || offset+len(cz.Conns) >= cz.Total {
+			return n, nil
+		}
+		offset += len(cz.Conns)
 	}
-	return n, nil
 }
 
 func (m *Manager) setBound(name, nodeKey string) {
@@ -445,6 +520,13 @@ func (m *Manager) handleDisconnect(msg *nats.Msg) {
 		m.deleteBound(connName)
 		m.publishRelease(account, connName, connName, claimID)
 	}
+}
+
+func (m *Manager) lockNodeKey(nodeKey string) func() {
+	v, _ := m.keyMu.LoadOrStore(nodeKey, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func encodeRegisterOK(nodeKey, inbox string) []byte {

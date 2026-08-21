@@ -166,6 +166,40 @@ func TestRegisterConnzFailureIsNodeKeyInUse(t *testing.T) {
 	}
 }
 
+func TestRegisterConnzFailureUnclaimedReplies(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.countNamed = func(string) (int, error) {
+		return 0, errConnzUnavailable
+	}
+	c := agentConn(t, s, "solo")
+	msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`))
+	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) && !bytes.Contains(msg.Data, []byte(`invalid_request`)) {
+		t.Fatalf("want error reply on unclaimed connz failure, got %s", msg.Data)
+	}
+}
+
+func TestRegisterZeroCountNameMismatch(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.countNamed = func(string) (int, error) {
+		return 0, nil
+	}
+	c := agentConn(t, s, "solo")
+	msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`))
+	if !bytes.Contains(msg.Data, []byte(`name_mismatch`)) && !bytes.Contains(msg.Data, []byte(`invalid_request`)) {
+		t.Fatalf("want name_mismatch/invalid_request, got %s", msg.Data)
+	}
+}
+
 func TestCreateBeforeRegister(t *testing.T) {
 	s := startEmbedded(t)
 	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
