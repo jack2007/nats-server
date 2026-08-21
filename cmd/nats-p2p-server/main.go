@@ -36,6 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	p2p.ApplyClientPingDefaults(opts, natsRaw)
 	if has {
 		if err := p2p.ValidateConfig(pcfg); err != nil {
 			log.Fatal(err)

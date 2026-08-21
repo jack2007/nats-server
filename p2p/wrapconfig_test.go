@@ -3,6 +3,9 @@ package p2p
 import (
 	"bytes"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 func TestSplitP2PBlock(t *testing.T) {
@@ -46,5 +49,32 @@ p2p { turn_urls: ["turn:127.0.0.1:3478?transport=udp"] }
 	}
 	if err := ValidateConfig(cfg); err == nil {
 		t.Fatal("loopback must fail validate")
+	}
+}
+
+func TestApplyClientPingDefaultsWhenOmitted(t *testing.T) {
+	opts := &server.Options{
+		PingInterval: 2 * time.Minute,
+		MaxPingsOut:  2,
+	}
+	ApplyClientPingDefaults(opts, []byte("port: 4222\n"))
+	if opts.PingInterval != 5*time.Second || opts.MaxPingsOut != 3 {
+		t.Fatalf("got interval=%v max=%d", opts.PingInterval, opts.MaxPingsOut)
+	}
+}
+
+func TestApplyClientPingDefaultsRespectsExplicit(t *testing.T) {
+	opts := &server.Options{
+		PingInterval: 20 * time.Second,
+		MaxPingsOut:  8,
+	}
+	ApplyClientPingDefaults(opts, []byte(`
+port: 4222
+ping_interval: "20s"
+ping_max: 8
+`))
+	if opts.PingInterval != 20*time.Second || opts.MaxPingsOut != 8 {
+		t.Fatalf("explicit keys must keep ProcessConfigFile values, got interval=%v max=%d",
+			opts.PingInterval, opts.MaxPingsOut)
 	}
 }

@@ -6,6 +6,8 @@
 
 修订：同日改为 **Go 库嵌入**——包装进程用公开 API 嵌入 `nats-server`，`$P2P` 在独立包中以 NATS 客户端实现。不再把占用表/TURN 做进 `server/*.go`，也不再走 cluster route 私有协议。
 
+同日再修订：包装进程产品默认 `ping_interval=5s`、`ping_max=3`（§4.4），缩短强杀后占用释放窗口；不改 `server/` 内核默认。Agent `node_key` 为 16 hex。
+
 ## 1. 背景与目标
 
 让 raypx2 Agent（以及其它 NATS 客户端）连上嵌入式 `nats-server` 后做 ICE **协商**，并由 **P2P 模块**签发 coturn 短时凭据。数据面仍走 UDP（直连 / STUN / coturn）。
@@ -65,7 +67,7 @@
 | 会话 | `CREATE` 确认两端已登记，发 `invite` | 不转发 QUIC，不复制会话状态 |
 | TURN 签发 | 读本模块长期 secret，算短时票 | 不访问 coturn 网络接口 |
 
-`node_key` 由 Agent 本地生成。NATS `CONNECT` 的 `name` **必须等于** `node_key`，以便用 `$SYS` 连接事件把占用绑到真实连接（嵌入模式下订阅方看不到对端 `cid`，除非走系统事件 / CONNZ）。
+`node_key` 由 Agent 本地用 64-bit CSPRNG 生成，编码为 **16 个 hex 字符**，写入 Agent 配置后复用。NATS `CONNECT` 的 `name` **必须等于** `node_key`，以便用 `$SYS` 连接事件把占用绑到真实连接（嵌入模式下订阅方看不到对端 `cid`，除非走系统事件 / CONNZ）。
 
 `CREATE` 的「自己」只认该连接已登记的 `node_key`（且等于 CONNECT name），请求体不得改写己方身份。
 
@@ -186,6 +188,8 @@ TURN 未启用时省略 `turn`，仍返回 `stun_urls`。
 
 连接在线与否：P2P 用系统账号订阅 `$SYS.ACCOUNT.*.CONNECT` / `DISCONNECT`（必要时辅以 `$SYS.REQ.SERVER.CONNZ`）。Agent 断开后释放对应占用。不另做 P2P 心跳。
 
+进程被强杀时，占用要等 nats-server 协议 PING 超时、发出 `$SYS DISCONNECT` 后才释放。内核默认 `ping_interval=2m`、`ping_max=2` 太长，同 key 的新进程会在窗口内收到 `node_key_in_use` 并换身份。包装进程必须把客户端探活缩短，见 §4.4。
+
 ### 4.1 REGISTER 两阶段
 
 处理该请求的 P2P 实例（queue group 赢家）执行：
@@ -217,6 +221,28 @@ TURN 未启用时省略 `turn`，仍返回 `stun_urls`。
 
 CREATE 只查占用表（本机 + 已 COMMIT 的副本）。对端连在另一台嵌入节点上即可。会话不在集群复制：`invite` 与 ICE subject 走 NATS 兴趣路由。
 
+### 4.4 客户端探活（协议 PING）
+
+nats-server **会主动**向客户端发协议 `PING`，等 `PONG`。这不是 OS TCP keepalive。未应答次数超过 `ping_max` 后关连接，错误为 `Stale Connection`，随后 `$SYS DISCONNECT` 释放占用。
+
+P2P 包装进程产品默认（**不改** `server/` 内核默认值；在 `ProcessConfigFile` 之后写入 `server.Options`）：
+
+```
+ping_interval: "5s"
+ping_max: 3
+```
+
+| 项 | 值 | 含义 |
+| --- | --- | --- |
+| `ping_interval` | `5s` | 服务端向客户端发 PING 的周期 |
+| `ping_max` | `3` | 允许未应答的 PING 数；再多一个周期则关连接 |
+
+死连接检出最坏约 **20 秒**（发出 3 个 PING 后，下一个 5s 周期关闭）。`nats.c` 自动回 PONG，Agent 不必实现探活。
+
+nats 配置段若**显式**写了 `ping_interval` / `ping_max`，尊重运维值。省略则套上 5s/3，避免沿用内核 2m/2。
+
+缩短 ping 只压缩「旧 TCP 尚未 DISCONNECT」窗口。两份活进程共用同一 `node_key`、或集群 PREPARE 超时，仍回 `node_key_in_use`；换身份由 Agent 处理。
+
 ## 5. TURN
 
 coturn 仍为独立进程。P2P 模块不发起 Allocate，不转发媒体。嵌入式 `nats-server` **不持有** coturn secret。
@@ -227,6 +253,9 @@ coturn 仍为独立进程。P2P 模块不发起 Allocate，不转发媒体。嵌
 
 ```
 # nats 段：标准 nats-server 选项（cluster、authorization 等）
+# 省略 ping_* 时包装进程套上 5s/3；也可显式写出：
+# ping_interval: "5s"
+# ping_max: 3
 
 p2p {
   stun_urls: ["stun:turn.example.com:3478"]
@@ -242,6 +271,7 @@ p2p {
 - `realm` 只配在 coturn，不发给客户端。
 - P2P 段存在且 URL 非法：包装进程启动失败。
 - `secret_file` 缺失或不可读：`$P2P` 控制面仍启用，invite 省略 `turn`。
+- nats 段省略 `ping_interval` / `ping_max` 时，包装进程在 `ProcessConfigFile` 之后把 `Options` 设为 `5s` / `3`（见 §4.4）。
 
 长期 secret 不写日志、不经 `$SYS` 业务事件、不进面向 Agent 的报文以外的监控。
 
@@ -299,6 +329,7 @@ NATS 认证失败、subject 权限拒绝仍走 NATS 协议错误。
 1. REGISTER 成功后，同一连接再 REGISTER 同一 key 成功。
 2. 第二条连接（同一 `name`）REGISTER → `node_key_in_use`。
 3. 第一条断开后，同一 key 可被新连接登记。
+3b. 配置省略 `ping_*` 时，包装后的 `Options.PingInterval==5s` 且 `MaxPingsOut==3`；显式写出则保持运维值。
 4. `node_key` ≠ CONNECT name → `name_mismatch`。
 5. 两端均已登记时 CREATE：双方 inbox 收到无 `grant` 的 `invite`，且含 `ice_subject`。
 6. 对端未登记 → `peer_not_registered`。
@@ -320,7 +351,8 @@ NATS 认证失败、subject 权限拒绝仍走 NATS 协议错误。
 | 产品形态 | NATS 作信令总线；`$P2P` 为嵌入式旁路模块 |
 | 进程模型 | Go 库嵌入：一进程 = nats-server + P2P 客户端 |
 | 与内核关系 | 不改 `server/`；只用公开 API |
-| 身份 | Agent 自生成 `node_key`；CONNECT `name` = `node_key` |
+| 身份 | Agent 自生成 16 hex `node_key`；CONNECT `name` = `node_key` |
+| 客户端探活 | 包装进程默认 `ping_interval=5s`、`ping_max=3`；不改 `server/` 内核默认 |
 | 占用 | 同一 account 内先到先得；`$P2P.MGR.*` 两阶段 |
 | grant | 不签发 |
 | TURN | P2P 模块持有长期 secret，CREATE 签发短时票 |

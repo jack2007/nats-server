@@ -8,7 +8,35 @@ import (
 	"unicode"
 
 	"github.com/nats-io/nats-server/v2/conf"
+	"github.com/nats-io/nats-server/v2/server"
 )
+
+const (
+	DefaultClientPingInterval = 5 * time.Second
+	DefaultClientPingMax      = 3
+)
+
+// ApplyClientPingDefaults sets product ping_interval=5s / ping_max=3 when the
+// nats config section omitted those keys. Explicit values already loaded into
+// opts by ProcessConfigFile are left unchanged.
+func ApplyClientPingDefaults(opts *server.Options, natsConf []byte) {
+	if opts == nil {
+		return
+	}
+	m, err := conf.Parse(string(natsConf))
+	hasInterval := false
+	hasMax := false
+	if err == nil {
+		_, hasInterval = m["ping_interval"]
+		_, hasMax = m["ping_max"]
+	}
+	if !hasInterval {
+		opts.PingInterval = DefaultClientPingInterval
+	}
+	if !hasMax {
+		opts.MaxPingsOut = DefaultClientPingMax
+	}
+}
 
 // SplitP2PBlock extracts a top-level p2p { ... } block from a combined config file.
 // The remaining bytes are suitable for server.ProcessConfigFile.

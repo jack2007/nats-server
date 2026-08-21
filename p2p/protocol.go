@@ -59,7 +59,7 @@ type inviteFrame struct {
 }
 
 type invitePayload struct {
-	StunURLs   []string  `json:"stun_urls"`
+	StunURLs   []string  `json:"stun_urls,omitempty"`
 	Turn       *TurnCred `json:"turn,omitempty"`
 	ICESubject string    `json:"ice_subject"`
 }

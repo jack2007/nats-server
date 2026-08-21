@@ -47,3 +47,18 @@ func TestEncodeInviteOmitsGrantAndOptionalTurn(t *testing.T) {
 		t.Fatalf("ice_subject=%v", payload["ice_subject"])
 	}
 }
+
+func TestEncodeInviteOmitsEmptyStunURLs(t *testing.T) {
+	raw, err := EncodeInvite("sid", "conn-0", 1, nil, nil, "$P2P.ICE.sid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		t.Fatal(err)
+	}
+	payload := frame["payload"].(map[string]any)
+	if _, ok := payload["stun_urls"]; ok {
+		t.Fatalf("empty stun_urls must be omitted: %v", payload["stun_urls"])
+	}
+}
