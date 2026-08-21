@@ -16,7 +16,7 @@ func TestValidNodeKey(t *testing.T) {
 
 func TestEncodeErrorJSON(t *testing.T) {
 	var m map[string]any
-	if err := json.Unmarshal(EncodeError(ErrNodeKeyInUse), &m); err != nil {
+	if err := json.Unmarshal(EncodeError(CodeNodeKeyInUse), &m); err != nil {
 		t.Fatal(err)
 	}
 	if m["ok"] != false || m["error"] != "node_key_in_use" {

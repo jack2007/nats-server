@@ -11,7 +11,7 @@ const (
 	ErrInvalidNodeKey    = "invalid_node_key"
 	ErrNameMismatch      = "name_mismatch"
 	ErrAlreadyRegistered = "already_registered"
-	ErrNodeKeyInUse      = "node_key_in_use"
+	CodeNodeKeyInUse     = "node_key_in_use"
 	ErrNotRegistered     = "not_registered"
 	ErrPeerNotRegistered = "peer_not_registered"
 	ErrPeerIsSelf        = "peer_is_self"
