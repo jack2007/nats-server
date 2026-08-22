@@ -50,15 +50,39 @@ func main() {
 	if !s.ReadyForConnections(10 * time.Second) {
 		log.Fatal("nats-server not ready")
 	}
-	if has {
-		m, err := p2p.StartManager(s, pcfg)
+	var auth *p2p.AuthCalloutService
+	if opts.AuthCallout != nil {
+		if err := p2p.CheckIssuer(opts.AuthCallout.Issuer); err != nil {
+			log.Fatal(err)
+		}
+		user, pass, err := p2p.AuthInternalCredentials(opts)
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer m.Stop()
+		auth, err = p2p.StartAuthCallout(s, user, pass)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	var m *p2p.Manager
+	if has {
+		var err error
+		m, err = p2p.StartManager(s, pcfg)
+		if err != nil {
+			if auth != nil {
+				auth.Stop()
+			}
+			log.Fatal(err)
+		}
 	}
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
+	if m != nil {
+		m.Stop()
+	}
+	if auth != nil {
+		auth.Stop()
+	}
 	s.Shutdown()
 }
