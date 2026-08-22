@@ -63,17 +63,26 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer auth.Stop()
 	}
+	var m *p2p.Manager
 	if has {
-		m, err := p2p.StartManager(s, pcfg)
+		var err error
+		m, err = p2p.StartManager(s, pcfg)
 		if err != nil {
+			if auth != nil {
+				auth.Stop()
+			}
 			log.Fatal(err)
 		}
-		defer m.Stop()
 	}
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
+	if m != nil {
+		m.Stop()
+	}
+	if auth != nil {
+		auth.Stop()
+	}
 	s.Shutdown()
 }
