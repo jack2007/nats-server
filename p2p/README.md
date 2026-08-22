@@ -19,5 +19,6 @@ Required:
 - `issuer`: public account nkey that matches the embedded seed in `p2p/auth_callout.go` (`IssuerPublic()`).
 - `auth_users`: in-process clients only (`auth-internal`, and `p2p-internal` / `sys` if used).
 - `users`: passwords for those internal names. `p2p { agent_username / agent_password }` must equal `p2p-internal`.
+- Do **not** add extra `permissions` on `auth-internal`. The server replies on `$SYS._INBOX.*` (`newRespInbox`), not `_INBOX.>`. Restricting publish to `_INBOX.>` (or subscribe-only `$SYS.REQ.USER.AUTH`) drops the reply; every CONNECT then fails with `Authorization Violation` after `authorization.timeout`. Leave both internal users unrestricted, matching `p2p/auth_callout_test.go`.
 
 The wrapper starts the in-process callout subscriber after `ReadyForConnections` and before `StartManager`. Agent username/password are temporary constants in `p2p/auth_callout.go`; do not put them in this README. Without `auth_callout`, behavior stays on the static user list.

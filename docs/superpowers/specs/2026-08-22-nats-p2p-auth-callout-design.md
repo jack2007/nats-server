@@ -66,8 +66,8 @@ Agent 侧：`~/src/raypx2/docs/superpowers/specs/2026-08-22-nats-auth-callout-de
 authorization {
   timeout: 2s
   users: [
-    { user: auth-internal, password: "<内部>", permissions: { subscribe: ["$SYS.REQ.USER.AUTH"] } }
-    { user: p2p-internal,  password: "<内部>", permissions: { publish: [">"], subscribe: [">"] } }
+    { user: auth-internal, password: "<内部>" }
+    { user: p2p-internal,  password: "<内部>" }
   ]
   auth_callout {
     issuer: "A..."          # 与代码内测试种子对应的公钥
@@ -81,6 +81,7 @@ authorization {
 - 若已用 `sys_username` 订 `$SYS` DISCONNECT：该用户也要进 `users` 与 `auth_users`。
 - 开 Callout 后，静态 `users` 里除 `auth_users` 外都会走 Callout。Agent 不要再写进这份 `users` 表。
 - 包装进程在 `ProcessConfigFile` 之后：用代码内 issuer 种子导出公钥，与 `authorization.auth_callout.issuer` 比较，不一致则启动失败。
+- **不要**给 `auth-internal` 加过窄的 `permissions`。内核 Callout 回包走 `$SYS._INBOX.*`（`server.Server.newRespInbox`），不是 Agent JWT 里的 `_INBOX.>`。若只允许 `publish: ["_INBOX.>"]` 或只允许 `subscribe: ["$SYS.REQ.USER.AUTH"]`，应答会被丢掉，合法凭据也会在 `authorization.timeout` 后变成 `Authorization Violation`。v1 与 `p2p/auth_callout_test.go` 一致：这两个内部用户不写 `permissions`。
 
 ### 4.2 不加 `auth {}`
 
@@ -117,11 +118,9 @@ JWT 有效期按连接生命周期（数小时量级即可）。断线重连再�
 
 ## 7. 测试
 
-- 正确常量：CONNECT 成功；可 REGISTER/CREATE；不可 pub/sub `$P2P.MGR.>` / `$SYS.>`。
-- 错误密码、空凭据：CONNECT 失败。
-- `auth-internal` / `p2p-internal` 绕过 Callout；现有 `go test ./p2p/...` 回归通过。
-- 原 `app`/`app` 测试改为走 Callout + 代码常量，或改用内部账号。
-- 双实例 cluster：各节点本地 Callout，对端不能代答。
+InProcess 基线（已落地）：正确常量 CONNECT + REGISTER；错密码失败；不可 `$P2P.MGR`；`auth-internal` / `p2p-internal` 绕过 Callout。
+
+P0/P1 补充（必须走 TCP/`ProcessConfigFile`、覆盖 `$SYS`、CREATE+TURN、无 sys 占用、双节点本地 Callout）：见 `docs/superpowers/specs/2026-08-22-nats-p2p-auth-callout-test-gaps-design.md`。
 
 ## 8. 公网切换（`64.176.42.49`）
 
