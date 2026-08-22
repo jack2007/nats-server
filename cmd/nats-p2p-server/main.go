@@ -50,6 +50,21 @@ func main() {
 	if !s.ReadyForConnections(10 * time.Second) {
 		log.Fatal("nats-server not ready")
 	}
+	var auth *p2p.AuthCalloutService
+	if opts.AuthCallout != nil {
+		if err := p2p.CheckIssuer(opts.AuthCallout.Issuer); err != nil {
+			log.Fatal(err)
+		}
+		user, pass, err := p2p.AuthInternalCredentials(opts)
+		if err != nil {
+			log.Fatal(err)
+		}
+		auth, err = p2p.StartAuthCallout(s, user, pass)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer auth.Stop()
+	}
 	if has {
 		m, err := p2p.StartManager(s, pcfg)
 		if err != nil {
