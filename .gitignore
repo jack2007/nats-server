@@ -12,6 +12,9 @@ dist
 *.conf
 *.cfg
 
+# nats-p2p deployment reference configs
+!conf/nats-p2p-*.conf
+
 # Architecture specific extensions/prefixes
 *.[568vq]
 [568vq].out
