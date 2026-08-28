@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -46,7 +45,7 @@ func TestEncodeAgentUserJWTPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := EncodeAgentUserJWT(pub)
+	raw, err := EncodeAgentUserJWT(pub, "client-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,21 +59,87 @@ func TestEncodeAgentUserJWTPermissions(t *testing.T) {
 	if uc.Audience != "$G" {
 		t.Fatalf("aud %s", uc.Audience)
 	}
-	allowPub := strings.Join(uc.Pub.Allow, ",")
-	allowSub := strings.Join(uc.Sub.Allow, ",")
-	for _, s := range []string{"$P2P.REGISTER", "$P2P.CREATE", "$P2P.UNREGISTER", "$P2P.ICE.>"} {
-		if !strings.Contains(allowPub, s) {
-			t.Fatalf("missing pub %s in %s", s, allowPub)
+	wantCMD, wantEVENT := v2AllowSubjects(t, "client-a")
+	if !hasExactSubject(uc.Pub.Allow, wantCMD) {
+		t.Fatalf("missing pub %s in %v", wantCMD, []string(uc.Pub.Allow))
+	}
+	if !hasExactSubject(uc.Sub.Allow, wantEVENT) || !hasExactSubject(uc.Sub.Allow, "_INBOX.>") {
+		t.Fatalf("missing sub %s or _INBOX.> in %v", wantEVENT, []string(uc.Sub.Allow))
+	}
+}
+
+func TestAgentPermissionsV2(t *testing.T) {
+	kp, err := nkeys.CreateUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := kp.PublicKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := EncodeAgentUserJWT(pub, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uc, err := jwt.DecodeUserClaims(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uc.Subject != pub {
+		t.Fatalf("sub %s", uc.Subject)
+	}
+	wantCMD, wantEVENT := v2AllowSubjects(t, "node-a")
+	if !hasExactSubject(uc.Pub.Allow, wantCMD) {
+		t.Fatalf("pub allow %v, want %s", []string(uc.Pub.Allow), wantCMD)
+	}
+	if hasExactSubject(uc.Pub.Allow, "$P2P.V2.CMD.node-b.>") ||
+		hasExactSubject(uc.Pub.Allow, "$P2P.V2.MGR.>") ||
+		hasExactSubject(uc.Pub.Allow, "$P2P.REGISTER") ||
+		hasExactSubject(uc.Pub.Allow, "$P2P.CREATE") ||
+		hasExactSubject(uc.Pub.Allow, "$P2P.UNREGISTER") ||
+		hasExactSubject(uc.Pub.Allow, "$P2P.ICE.>") {
+		t.Fatalf("pub allow must not grant other-node CMD, MGR, or V1 subjects: %v", []string(uc.Pub.Allow))
+	}
+	if !hasExactSubject(uc.Sub.Allow, wantEVENT) || !hasExactSubject(uc.Sub.Allow, "_INBOX.>") {
+		t.Fatalf("sub allow %v, want %s and _INBOX.>", []string(uc.Sub.Allow), wantEVENT)
+	}
+	if hasExactSubject(uc.Sub.Allow, "$P2P.V2.EVENT.node-b.>") ||
+		hasExactSubject(uc.Sub.Allow, "$P2P.V2.MGR.>") ||
+		hasExactSubject(uc.Sub.Allow, "$P2P.NODE.>") ||
+		hasExactSubject(uc.Sub.Allow, "$P2P.ICE.>") {
+		t.Fatalf("sub allow must not grant other-node EVENT, MGR, or V1 subjects: %v", []string(uc.Sub.Allow))
+	}
+	if _, err := EncodeAgentUserJWT(pub, ""); err == nil {
+		t.Fatal("empty node key must be rejected")
+	}
+	if _, err := EncodeAgentUserJWT(pub, "bad node"); err == nil {
+		t.Fatal("invalid node key must be rejected")
+	}
+}
+
+func v2AllowSubjects(t *testing.T, nodeKey string) (cmdAllow, eventAllow string) {
+	t.Helper()
+	sample, err := CommandSubjectV2(nodeKey, string(FrameKindCreateV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmdAllow = strings.TrimSuffix(sample, string(FrameKindCreateV2)) + ">"
+	const zeroReg = "0123456789abcdef0123456789abcdef"
+	sample, err = EventSubjectV2(nodeKey, zeroReg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventAllow = strings.TrimSuffix(sample, zeroReg) + ">"
+	return cmdAllow, eventAllow
+}
+
+func hasExactSubject(list jwt.StringList, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
 		}
 	}
-	for _, s := range []string{"$P2P.NODE.>", "$P2P.ICE.>", "_INBOX.>"} {
-		if !strings.Contains(allowSub, s) {
-			t.Fatalf("missing sub %s in %s", s, allowSub)
-		}
-	}
-	if strings.Contains(allowPub, ">") && allowPub == ">" {
-		t.Fatal("pub must not be >")
-	}
+	return false
 }
 
 func TestEncodeAuthResponseError(t *testing.T) {
@@ -166,18 +231,21 @@ func TestAuthCalloutAcceptsAgentAndBlocksMgr(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(nc.Close)
-	if err := nc.Publish("$P2P.ICE.sess", []byte("x")); err != nil {
+	cmd, err := CommandSubjectV2("client-a", string(FrameKindCreateV2))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nc.Subscribe("$P2P.NODE.client-a", func(*nats.Msg) {}); err != nil {
+	if err := nc.Publish(cmd, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	got := requestP2P(t, nc, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`))
-	if !bytes.Contains(got.Data, []byte(`"ok":true`)) {
-		t.Fatalf("register: %s", got.Data)
+	ev, err := EventSubjectV2("client-a", "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nc.Subscribe(ev, func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
 	}
 	if err := nc.Publish("$P2P.MGR.PREPARE", []byte("x")); err == nil {
-		// 权限拒绝可能在异步错误里；等一下
 		time.Sleep(100 * time.Millisecond)
 	}
 	async := make(chan error, 1)
@@ -205,5 +273,18 @@ func TestAuthInternalCredentials(t *testing.T) {
 	_, _, err = AuthInternalCredentials(&server.Options{})
 	if err == nil {
 		t.Fatal("expected error without callout")
+	}
+}
+
+func TestAuthCalloutRejectsInvalidConnectNameV2(t *testing.T) {
+	s := startEmbeddedCallout(t)
+	svc, err := StartAuthCallout(s, AuthInternalName, "auth-internal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(svc.Stop)
+	_, err = nats.Connect("", nats.InProcessServer(s), nats.UserInfo(AgentUser, AgentPassword), nats.Name("bad node"))
+	if err == nil {
+		t.Fatal("invalid CONNECT name must be denied")
 	}
 }

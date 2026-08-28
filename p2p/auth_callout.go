@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
@@ -54,20 +55,38 @@ func MatchAgentCreds(user, password string) bool {
 	return u == 1 && p == 1
 }
 
-func EncodeAgentUserJWT(userNkey string) (string, error) {
+func agentV2AllowSubjects(nodeKey string) (cmdAllow, eventAllow string, err error) {
+	if err := ValidateNodeKeyV2(nodeKey); err != nil {
+		return "", "", err
+	}
+	sample, err := CommandSubjectV2(nodeKey, string(FrameKindCreateV2))
+	if err != nil {
+		return "", "", err
+	}
+	cmdAllow = strings.TrimSuffix(sample, string(FrameKindCreateV2)) + ">"
+	const sampleReg = "0123456789abcdef0123456789abcdef"
+	sample, err = EventSubjectV2(nodeKey, sampleReg)
+	if err != nil {
+		return "", "", err
+	}
+	eventAllow = strings.TrimSuffix(sample, sampleReg) + ">"
+	return cmdAllow, eventAllow, nil
+}
+
+func EncodeAgentUserJWT(userNKey, nodeKey string) (string, error) {
 	kp, err := issuerKeyPair()
 	if err != nil {
 		return "", err
 	}
-	uc := jwt.NewUserClaims(userNkey)
+	cmdAllow, eventAllow, err := agentV2AllowSubjects(nodeKey)
+	if err != nil {
+		return "", err
+	}
+	uc := jwt.NewUserClaims(userNKey)
 	uc.Audience = "$G"
 	uc.Expires = time.Now().Add(agentJWTTTL).Unix()
-	uc.Pub.Allow.Add("$P2P.REGISTER")
-	uc.Pub.Allow.Add("$P2P.CREATE")
-	uc.Pub.Allow.Add("$P2P.UNREGISTER")
-	uc.Pub.Allow.Add("$P2P.ICE.>")
-	uc.Sub.Allow.Add("$P2P.NODE.>")
-	uc.Sub.Allow.Add("$P2P.ICE.>")
+	uc.Pub.Allow.Add(cmdAllow)
+	uc.Sub.Allow.Add(eventAllow)
 	uc.Sub.Allow.Add("_INBOX.>")
 	return uc.Encode(kp)
 }
@@ -160,7 +179,15 @@ func (a *AuthCalloutService) handle(msg *nats.Msg) {
 		}
 		return
 	}
-	ujwt, err := EncodeAgentUserJWT(userNkey)
+	nodeKey := ac.ConnectOptions.Name
+	if err := ValidateNodeKeyV2(nodeKey); err != nil {
+		raw, err := EncodeAuthResponse(userNkey, serverID, "", "authorization denied")
+		if err == nil {
+			_ = msg.Respond(raw)
+		}
+		return
+	}
+	ujwt, err := EncodeAgentUserJWT(userNkey, nodeKey)
 	if err != nil {
 		raw, encErr := EncodeAuthResponse(userNkey, serverID, "", "authorization denied")
 		if encErr == nil {

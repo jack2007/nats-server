@@ -315,6 +315,89 @@ func TestTCPCalloutDuplicateNodeKeyInUse(t *testing.T) {
 	}
 }
 
+// TestAuthCalloutTCPConnectNameSubjectScopeV2 proves an already-authenticated
+// connection cannot use another CONNECT name's V2 subjects. Shared-credential
+// holders reconnecting with a different CONNECT name are a trust-boundary
+// leftover of this release and are out of scope; this is not an
+// anti-impersonation test.
+func TestAuthCalloutTCPConnectNameSubjectScopeV2(t *testing.T) {
+	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), false, Config{})
+	a := mustConnectAgent(t, s, "node-a")
+	b := mustConnectAgent(t, s, "node-b")
+
+	ownCMD, err := CommandSubjectV2("node-a", string(FrameKindCreateV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownEVENT, err := EventSubjectV2("node-a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Publish(ownCMD, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Subscribe(ownEVENT, func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	otherCMD, err := CommandSubjectV2("node-b", string(FrameKindCreateV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherEVENT, err := EventSubjectV2("node-b", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectPermissionsViolation(t, a, func() error {
+		return a.Publish(otherCMD, []byte("x"))
+	})
+	expectPermissionsViolation(t, a, func() error {
+		_, err := a.Subscribe(otherEVENT, func(*nats.Msg) {})
+		return err
+	})
+	expectPermissionsViolation(t, b, func() error {
+		return b.Publish(ownCMD, []byte("x"))
+	})
+	expectPermissionsViolation(t, a, func() error {
+		return a.Publish("$P2P.V2.MGR.COMMAND", []byte("x"))
+	})
+	expectPermissionsViolation(t, a, func() error {
+		_, err := a.Subscribe("$P2P.V2.MGR.>", func(*nats.Msg) {})
+		return err
+	})
+	expectPermissionsViolation(t, a, func() error {
+		return a.Publish("$P2P.REGISTER", []byte("x"))
+	})
+	expectPermissionsViolation(t, a, func() error {
+		_, err := a.Subscribe("$P2P.NODE.node-a", func(*nats.Msg) {})
+		return err
+	})
+}
+
+func expectPermissionsViolation(t *testing.T, nc *nats.Conn, op func() error) {
+	t.Helper()
+	async := make(chan error, 4)
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { async <- e })
+	t.Cleanup(func() { nc.SetErrorHandler(nil) })
+	if err := op(); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "permission") {
+			return
+		}
+		t.Fatal(err)
+	}
+	select {
+	case err := <-async:
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "permission") {
+			t.Fatalf("expected permissions violation, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected permissions violation")
+	}
+}
+
 func TestTCPCalloutLeftoverAppAccountStaysOnGlobal(t *testing.T) {
 	conf := fmt.Sprintf(`
 listen: "127.0.0.1:-1"
