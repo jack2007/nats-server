@@ -30,9 +30,12 @@ var (
 	v2TestWorkers          int
 	v2TestBlock            func()
 	v2TestPublishHook      func(subj string, data []byte) error
-	v2TestHoldJoinQueue    <-chan struct{}
-	v2TestHoldRegisterSync <-chan struct{}
-	v2TestHoldRegisterNode string
+	v2TestHoldJoinQueue     <-chan struct{}
+	v2TestHoldRegisterSync  <-chan struct{}
+	v2TestHoldRegisterApply <-chan struct{}
+	v2TestHoldRegisterNode  string
+	v2TestBeforeCatchUp     func(*Manager)
+	v2TestCatchUpExtraNeed  int
 )
 
 type v2NodeBinding struct {
@@ -116,8 +119,13 @@ func (m *Manager) startV2() error {
 	if v2TestWorkers > 0 {
 		workers = v2TestWorkers
 	}
+	store := NewStoreV2(m.now, v2MaxConnections)
+	store.SetExpiryDurations(
+		NodeDisconnectGraceDuration(DefaultClientPingInterval, DefaultClientPingMax),
+		TombstoneDuration(DefaultSetupTimeoutV2),
+	)
 	m.v2 = &managerV2{
-		store:     NewStoreV2(m.now, v2MaxConnections),
+		store:     store,
 		cmdQ:      make(chan *nats.Msg, qsize),
 		stop:      make(chan struct{}),
 		nodes:     make(map[string]*v2NodeBinding),
@@ -136,15 +144,18 @@ func (m *Manager) startV2() error {
 	if err := m.startClusterV2(); err != nil {
 		return err
 	}
-	if err := m.catchUpV2(); err != nil {
-		return err
-	}
+	catchErr := m.catchUpV2()
 	for i := 0; i < workers; i++ {
 		m.v2.wg.Add(1)
 		go m.v2Worker()
 	}
 	m.v2.wg.Add(1)
 	go m.signalRetryLoopV2()
+	m.v2.wg.Add(1)
+	go m.expireLoopV2()
+	if catchErr != nil {
+		return m.nc.Flush()
+	}
 	if v2TestHoldJoinQueue != nil {
 		hold := v2TestHoldJoinQueue
 		m.v2.wg.Add(1)
@@ -650,6 +661,22 @@ func (m *Manager) signalRetryLoopV2() {
 	}
 }
 
+func (m *Manager) expireLoopV2() {
+	defer m.v2.wg.Done()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.v2.stop:
+			return
+		case <-ticker.C:
+			if ev := m.v2.store.Expire(m.now()); len(ev) > 0 {
+				_ = m.publishEventsV2(ev)
+			}
+		}
+	}
+}
+
 func (m *Manager) flushSignalRetriesV2() {
 	now := m.now()
 	if expired := m.v2.store.ExpirePendingSignals(now); len(expired) > 0 {
@@ -841,12 +868,23 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 			code = event.Error.Code
 		}
 		payload := map[string]any{
-			"error":           string(code),
-			"session_id":      event.Identity.SessionID,
-			"connection_id":   event.Identity.ConnectionID,
-			"epoch":           event.Identity.Epoch,
-			"revision":        event.Revision,
-			"sender_node_key": v2CoordinatorSender,
+			"error":         string(code),
+			"session_id":    event.Identity.SessionID,
+			"connection_id": event.Identity.ConnectionID,
+		}
+		if event.Revision != 0 {
+			payload["revision"] = event.Revision
+		}
+		if event.Error != nil {
+			if event.Error.SessionID != "" {
+				payload["session_id"] = event.Error.SessionID
+			}
+			if event.Error.ConnectionID != "" {
+				payload["connection_id"] = event.Error.ConnectionID
+			}
+			if event.Error.Revision != nil {
+				payload["revision"] = *event.Error.Revision
+			}
 		}
 		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
 	case FrameKindSignalSendV2:
@@ -1211,7 +1249,14 @@ func (m *Manager) forgetSessionOwnerV2(sessionID string) {
 }
 
 func (m *Manager) injectV2Disconnect(node string, cid uint64) {
-	body, _ := json.Marshal(map[string]any{"client": map[string]any{"name": node, "id": cid}})
+	m.injectV2DisconnectFrom(m.serverID, node, cid)
+}
+
+func (m *Manager) injectV2DisconnectFrom(serverID, node string, cid uint64) {
+	body, _ := json.Marshal(map[string]any{
+		"server": map[string]any{"id": serverID},
+		"client": map[string]any{"name": node, "id": cid, "cid": cid},
+	})
 	m.handleDisconnectV2(&nats.Msg{
 		Subject: "$SYS.ACCOUNT." + m.agentAccount() + ".DISCONNECT",
 		Data:    body,

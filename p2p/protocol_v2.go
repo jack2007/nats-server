@@ -786,10 +786,18 @@ func decodeStartV2(env EnvelopeV2) (*StartEventV2, error) {
 }
 
 func decodeErrorV2(env EnvelopeV2) (*ErrorPayloadV2, error) {
-	if err := requireRequestIDV2(env.RequestID); err != nil {
+	if env.RequestID != "" {
+		if err := requireRequestIDV2(env.RequestID); err != nil {
+			return nil, err
+		}
+	} else if err := requireEventIDsV2(env); err != nil {
 		return nil, err
 	}
-	var payload ErrorPayloadV2
+	var payload struct {
+		ErrorPayloadV2
+		Epoch         uint64 `json:"epoch,omitempty"`
+		SenderNodeKey string `json:"sender_node_key,omitempty"`
+	}
 	if err := decodeStrictV2(env.Payload, &payload); err != nil {
 		return nil, err
 	}
@@ -809,7 +817,13 @@ func decodeErrorV2(env EnvelopeV2) (*ErrorPayloadV2, error) {
 	if payload.Limit != nil && *payload.Limit != 128 {
 		return nil, invalidRequestV2()
 	}
-	return &payload, nil
+	if payload.SenderNodeKey != "" {
+		if err := ValidateNodeKeyV2(payload.SenderNodeKey); err != nil {
+			return nil, err
+		}
+	}
+	out := payload.ErrorPayloadV2
+	return &out, nil
 }
 
 func requireRequestIDV2(id string) error {

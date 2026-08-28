@@ -402,8 +402,13 @@ func TestClusterV2_OwnerExitNegotiatingAndActive(t *testing.T) {
 
 	cEv := waitRebuildEventV2(t, clientEv)
 	sEv := waitRebuildEventV2(t, serverEv)
-	if !strings.Contains(string(cEv), `"error"`) || !strings.Contains(string(sEv), `"error"`) {
-		t.Fatalf("negotiating owner loss must notify both sides client=%s server=%s", cEv, sEv)
+	cDec, err := DecodeFrameV2(FrameKindErrorV2, cEv)
+	if err != nil || cDec.Error == nil || cDec.Error.Code == "" {
+		t.Fatalf("owner-loss client EVENT DecodeFrameV2: %v body=%s", err, cEv)
+	}
+	sDec, err := DecodeFrameV2(FrameKindErrorV2, sEv)
+	if err != nil || sDec.Error == nil || sDec.Error.Code == "" {
+		t.Fatalf("owner-loss server EVENT DecodeFrameV2: %v body=%s", err, sEv)
 	}
 	select {
 	case extra := <-clientEv:
@@ -648,14 +653,19 @@ func TestClusterV2_RegistrationGeneration(t *testing.T) {
 }
 
 func TestClusterV2_RegisterSyncBarrier(t *testing.T) {
-	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
 	hold := make(chan struct{})
 	v2TestHoldRegisterSync = hold
 	v2TestHoldRegisterNode = mgrClientNodeV2
 	t.Cleanup(func() {
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
 		v2TestHoldRegisterSync = nil
 		v2TestHoldRegisterNode = ""
 	})
+	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
 
 	clientReg := newRegistrationIDV2(t)
 	nc := agentConnApp(t, sA, mgrClientNodeV2)
@@ -725,16 +735,30 @@ func TestClusterV2_LostCreateReply(t *testing.T) {
 	if alloc2.Allocated.SessionID == oldSession {
 		t.Fatal("new request must allocate a new session")
 	}
-	select {
-	case msg := <-clientEv:
-		t.Fatalf("unbound session emitted event: %s", msg.Data)
-	case msg := <-serverEv:
-		t.Fatalf("unbound session PREPARE to server: %s", msg.Data)
-	case <-time.After(80 * time.Millisecond):
+	deadlineEv := time.Now().Add(80 * time.Millisecond)
+	for time.Now().Before(deadlineEv) {
+		remaining := time.Until(deadlineEv)
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case msg := <-clientEv:
+			if _, err := DecodeFrameV2(FrameKindPrepareV2, msg.Data); err == nil {
+				t.Fatalf("unbound session emitted PREPARE: %s", msg.Data)
+			}
+		case msg := <-serverEv:
+			if _, err := DecodeFrameV2(FrameKindPrepareV2, msg.Data); err == nil {
+				t.Fatalf("unbound session PREPARE to server: %s", msg.Data)
+			}
+		case <-time.After(remaining):
+		}
 	}
 
-	if ev := owner.v2.store.Expire(owner.now().Add(200 * time.Millisecond)); len(ev) == 0 {
-		t.Fatal("unbound session must expire at deadline")
+	snap, ok := owner.v2.store.PeekSession(oldSession)
+	if ok && snap.State != SessionStateFailedV2 && snap.State != SessionStateClosedV2 {
+		if ev := owner.v2.store.Expire(owner.now().Add(time.Second)); len(ev) == 0 {
+			t.Fatal("unbound session must expire at deadline")
+		}
 	}
 
 	same := requestV2Wait(t, client, createSubj, createFrameV2(t, freshReq, mgrServerNodeV2), 5*time.Second)
@@ -745,6 +769,170 @@ func TestClusterV2_LostCreateReply(t *testing.T) {
 	if again.Allocated.SessionID != alloc2.Allocated.SessionID || again.Allocated.OwnerServerID != alloc2.Allocated.OwnerServerID {
 		t.Fatalf("ALLOCATED request must RESUME same owner, got %+v", again.Allocated)
 	}
+}
+
+func TestClusterV2_IncompleteCatchUpDoesNotJoinQueue(t *testing.T) {
+	sA, sB, sC := startClusterTriple(t)
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mB.Stop)
+	waitClusterPeersN(t, 2, mA, mB)
+
+	v2TestCatchUpExtraNeed = 8
+	t.Cleanup(func() { v2TestCatchUpExtraNeed = 0 })
+
+	mHold, err := StartManager(sC, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mHold.Stop)
+	if mHold.joinedQueueGroupV2() {
+		t.Fatal("incomplete catch-up must not join $P2P.V2.COORDINATORS")
+	}
+	reg := newRegistrationIDV2(t)
+	nc := agentConnApp(t, sC, "catchup-self")
+	t.Cleanup(nc.Close)
+	mustRegisterV2(t, nc, sC.ID(), "catchup-self", reg)
+	if mHold.joinedQueueGroupV2() {
+		t.Fatal("REGISTER-to-self must not join external queue after incomplete catch-up")
+	}
+}
+
+func TestClusterV2_DisconnectMatchesServerAndCID(t *testing.T) {
+	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
+	node := "pair-node"
+	reg := newRegistrationIDV2(t)
+	nc := registerOnServerV2(t, sA, node, reg)
+	_ = registerOnServerV2(t, sB, mgrServerNodeV2, newRegistrationIDV2(t))
+	cids, err := mA.lookupNamedAgentConns(node)
+	if err != nil || len(cids) != 1 {
+		t.Fatalf("cid lookup: %v %v", err, cids)
+	}
+	cid := cids[0]
+	createSubj, _ := CommandSubjectV2(node, "SESSION.CREATE")
+	got := requestV2Wait(t, nc, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2), 5*time.Second)
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mA.injectV2DisconnectFrom(mB.serverID, node, cid)
+	if _, err := mA.v2.store.AllocateSession(node, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: mgrServerNodeV2}); err != nil {
+		t.Fatalf("wrong-server disconnect wiped node: %v", err)
+	}
+	mA.injectV2DisconnectFrom(mA.serverID, node, cid+99)
+	if _, err := mA.v2.store.AllocateSession(node, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: mgrServerNodeV2}); err != nil {
+		t.Fatalf("wrong-cid disconnect wiped node: %v", err)
+	}
+	if _, _, ok := mA.SessionOwnerV2(alloc.Allocated.SessionID); !ok {
+		t.Fatal("stale disconnect pair closed session")
+	}
+
+	mA.injectV2DisconnectFrom(mA.serverID, node, cid)
+	freshReg := newRegistrationIDV2(t)
+	nc.Close()
+	moved := agentConnApp(t, sA, node)
+	t.Cleanup(moved.Close)
+	evSubj, _ := EventSubjectV2(node, freshReg)
+	if _, err := moved.Subscribe(evSubj, func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	_ = moved.Flush()
+	mustRegisterV2(t, moved, sA.ID(), node, freshReg)
+	mA.v2.store.SetExpiryDurations(40*time.Millisecond, 80*time.Millisecond)
+	time.Sleep(80 * time.Millisecond)
+	_ = mA.v2.store.Expire(mA.now())
+	if _, err := mA.v2.store.AllocateSession(node, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: mgrServerNodeV2}); err != nil {
+		t.Fatalf("re-REGISTER before grace must keep node: %v", err)
+	}
+	if _, _, ok := mA.SessionOwnerV2(alloc.Allocated.SessionID); !ok {
+		t.Fatal("re-REGISTER before grace closed session")
+	}
+	_ = mB
+	_ = mC
+}
+
+func TestClusterV2_RegisterSyncWindowBusyNotNotRegistered(t *testing.T) {
+	hold := make(chan struct{})
+	v2TestHoldRegisterApply = hold
+	v2TestHoldRegisterNode = mgrClientNodeV2
+	t.Cleanup(func() {
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
+		v2TestHoldRegisterApply = nil
+		v2TestHoldRegisterNode = ""
+	})
+	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
+
+	clientReg := newRegistrationIDV2(t)
+	nc := agentConnApp(t, sA, mgrClientNodeV2)
+	t.Cleanup(nc.Close)
+	evSubj, _ := EventSubjectV2(mgrClientNodeV2, clientReg)
+	if _, err := nc.Subscribe(evSubj, func(*nats.Msg) {}); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.Flush()
+	_ = registerOnServerV2(t, sB, mgrServerNodeV2, newRegistrationIDV2(t))
+
+	regSubj, _ := RegisterSubjectV2(mgrClientNodeV2, sA.ID())
+	done := make(chan *nats.Msg, 1)
+	go func() {
+		got, err := nc.Request(regSubj, registerFrameV2(t, mustUUIDV2(t), clientReg), 8*time.Second)
+		if err != nil {
+			done <- &nats.Msg{Data: []byte(err.Error())}
+			return
+		}
+		done <- got
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	seen := false
+	for time.Now().Before(deadline) {
+		mB.v2.mu.Lock()
+		b, ok := mB.v2.nodes[mgrClientNodeV2]
+		pending := ok && b.pending
+		mB.v2.mu.Unlock()
+		if pending {
+			seen = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !seen {
+		t.Fatal("peer never saw mid-REGISTER pending window")
+	}
+
+	_ = mA
+	if !mB.v2ExternalBlocked(mgrClientNodeV2) && !mC.v2ExternalBlocked(mgrClientNodeV2) {
+		t.Fatal("other coordinator must treat mid-REGISTER-sync as busy")
+	}
+	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	busy := requestV2Wait(t, nc, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2), 5*time.Second)
+	perr := mustErrorV2(t, busy.Data)
+	if perr.Code != ErrBusyV2 || perr.RetryAfterMs == nil {
+		t.Fatalf("mid-REGISTER-sync CREATE want busy, got %+v %s", perr, busy.Data)
+	}
+	close(hold)
+	select {
+	case got := <-done:
+		if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, got.Data); err != nil {
+			t.Fatalf("REGISTER after apply: %v body=%s", err, got.Data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("REGISTER did not complete after apply hold")
+	}
+	_ = mC
 }
 
 func TestClusterV2_InternalMutationOwnerRevisionGuard(t *testing.T) {

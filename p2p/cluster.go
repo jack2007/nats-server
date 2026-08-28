@@ -619,11 +619,15 @@ func (m *Manager) startClusterV2() error {
 }
 
 func (m *Manager) catchUpV2() error {
-	if m.peers == nil || (!m.inCluster() && len(m.peers.alive(m.now())) <= 1) {
+	if v2TestBeforeCatchUp != nil {
+		v2TestBeforeCatchUp(m)
+	}
+	extra := v2TestCatchUpExtraNeed
+	if m.peers == nil {
 		return nil
 	}
 	alive := m.peers.alive(m.now())
-	if len(alive) <= 1 {
+	if extra == 0 && (!m.inCluster() && len(alive) <= 1 || len(alive) <= 1) {
 		return nil
 	}
 	nc := m.mgrConn()
@@ -641,6 +645,7 @@ func (m *Manager) catchUpV2() error {
 	if need < 1 {
 		need = 1
 	}
+	need += extra
 	got := 0
 	for got < need {
 		remaining := time.Until(deadline)
@@ -663,8 +668,13 @@ func (m *Manager) catchUpV2() error {
 		}
 		got++
 	}
+	if got < need {
+		return errV2CatchUpIncomplete
+	}
 	return nil
 }
+
+var errV2CatchUpIncomplete = errors.New("v2 catch-up incomplete")
 
 func (m *Manager) joinExternalQueueV2() error {
 	m.v2.mu.Lock()
@@ -781,9 +791,48 @@ func (m *Manager) handleV2MgrSync(msg *nats.Msg) {
 		}
 		return
 	}
+	holdApply := v2TestHoldRegisterApply
+	holdNode := v2TestHoldRegisterNode
+	if mut.Kind == v2MutationRegister && mut.Sender != m.serverID && holdApply != nil &&
+		(holdNode == "" || mut.NodeKey == holdNode) {
+		m.noteRegisterPendingV2(mut)
+		if msg.Reply != "" {
+			_ = msg.Respond(m.encodeV2MgrAck(true, mut.MutationID))
+		}
+		select {
+		case <-holdApply:
+		case <-m.v2.stop:
+			return
+		}
+		_ = m.applyMutationV2(mut)
+		return
+	}
 	ok := m.applyMutationV2(mut)
 	if msg.Reply != "" {
 		_ = msg.Respond(m.encodeV2MgrAck(ok, mut.MutationID))
+	}
+}
+
+func (m *Manager) noteRegisterPendingV2(mut v2MgrMutation) {
+	if m.v2 == nil || mut.NodeKey == "" {
+		return
+	}
+	m.v2.mu.Lock()
+	defer m.v2.mu.Unlock()
+	if existing, ok := m.v2.nodes[mut.NodeKey]; ok {
+		existing.pending = true
+		if mut.RegistrationID != "" {
+			existing.registrationID = mut.RegistrationID
+		}
+		return
+	}
+	m.v2.nodes[mut.NodeKey] = &v2NodeBinding{
+		registrationID: mut.RegistrationID,
+		epoch:          mut.RegistrationEpoch,
+		cid:            mut.CID,
+		natsServerID:   mut.NatsServerID,
+		requestID:      mut.RequestID,
+		pending:        true,
 	}
 }
 
@@ -1041,6 +1090,9 @@ func (m *Manager) publishOwnerExitV2() {
 
 func (m *Manager) handleDisconnectV2(msg *nats.Msg) {
 	var ev struct {
+		Server struct {
+			ID string `json:"id"`
+		} `json:"server"`
 		Client struct {
 			Name string `json:"name"`
 			ID   uint64 `json:"id"`
@@ -1055,12 +1107,13 @@ func (m *Manager) handleDisconnectV2(msg *nats.Msg) {
 	if cid == 0 {
 		cid = ev.Client.ID
 	}
-	if node == "" {
+	serverID := ev.Server.ID
+	if node == "" || serverID == "" || cid == 0 {
 		return
 	}
 	m.v2.mu.Lock()
 	b, ok := m.v2.nodes[node]
-	if !ok || (b.cid != 0 && cid != 0 && b.cid != cid) {
+	if !ok || b.natsServerID != serverID || b.cid != cid {
 		m.v2.mu.Unlock()
 		return
 	}

@@ -77,6 +77,8 @@ type StoreV2 struct {
 	mu         sync.Mutex
 	now        func() time.Time
 	maxConns   int
+	nodeGrace  time.Duration
+	tombTTL    time.Duration
 	nodes      map[string]*nodeRecordV2
 	sessions   map[string]*sessionRecordV2
 	tombs      map[string]*sessionRecordV2
@@ -138,6 +140,8 @@ func NewStoreV2(now func() time.Time, maxConnectionsPerSession int) *StoreV2 {
 	return &StoreV2{
 		now:        now,
 		maxConns:   maxConnectionsPerSession,
+		nodeGrace:  NodeDisconnectGraceV2,
+		tombTTL:    DefaultTombstoneTTLV2,
 		nodes:      make(map[string]*nodeRecordV2),
 		sessions:   make(map[string]*sessionRecordV2),
 		tombs:      make(map[string]*sessionRecordV2),
@@ -518,10 +522,47 @@ func (s *StoreV2) ExpirePendingSignals(now time.Time) []EventV2 {
 	return events
 }
 
+func (s *StoreV2) SetExpiryDurations(grace, tombstone time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if grace > 0 {
+		s.nodeGrace = grace
+	}
+	if tombstone > 0 {
+		s.tombTTL = tombstone
+	}
+}
+
+func (s *StoreV2) disconnectGrace() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nodeGrace > 0 {
+		return s.nodeGrace
+	}
+	return NodeDisconnectGraceV2
+}
+
+func (s *StoreV2) tombstoneTTL() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tombTTL > 0 {
+		return s.tombTTL
+	}
+	return DefaultTombstoneTTLV2
+}
+
 func (s *StoreV2) Expire(now time.Time) []EventV2 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var events []EventV2
+	grace := s.nodeGrace
+	if grace <= 0 {
+		grace = NodeDisconnectGraceV2
+	}
+	tomb := s.tombTTL
+	if tomb <= 0 {
+		tomb = DefaultTombstoneTTLV2
+	}
 	for _, sess := range s.sessions {
 		if sess.state == SessionStateAllocatedV2 || sess.state == SessionStatePreparingV2 {
 			if !now.Before(sess.setupDeadline) {
@@ -549,12 +590,12 @@ func (s *StoreV2) Expire(now time.Time) []EventV2 {
 		}
 	}
 	for key, n := range s.nodes {
-		if n.disconnectedAt != nil && !now.Before(n.disconnectedAt.Add(NodeDisconnectGraceV2)) {
+		if n.disconnectedAt != nil && !now.Before(n.disconnectedAt.Add(grace)) {
 			delete(s.nodes, key)
 		}
 	}
 	for id, sess := range s.tombs {
-		if !sess.closedAt.IsZero() && !now.Before(sess.closedAt.Add(DefaultTombstoneTTLV2)) {
+		if !sess.closedAt.IsZero() && !now.Before(sess.closedAt.Add(tomb)) {
 			s.dropSessionRequests(id)
 			delete(s.tombs, id)
 		}

@@ -705,6 +705,23 @@ func TestV2Protocol_RequiredFieldsByKind(t *testing.T) {
 	}
 }
 
+func TestV2Protocol_ErrorEventDecodesWithoutRequestID(t *testing.T) {
+	body := `{"version":2,"message_id":"` + testMessageIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{"error":"setup_timeout","session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","revision":3}}`
+	dec, err := DecodeFrameV2(FrameKindErrorV2, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dec.Error == nil || dec.Error.Code != ErrSetupTimeoutV2 {
+		t.Fatalf("event error=%+v", dec.Error)
+	}
+	if dec.Error.SessionID != testSessionIDV2 || dec.Error.ConnectionID != "conn-0" {
+		t.Fatalf("event error identity %+v", dec.Error)
+	}
+	if dec.Error.Revision == nil || *dec.Error.Revision != 3 {
+		t.Fatalf("event error revision=%v", dec.Error.Revision)
+	}
+}
+
 func TestV2Protocol_SizeLimits(t *testing.T) {
 	overFrame := bytes.Repeat([]byte("x"), MaxFrameBytesV2+1)
 	_, err := DecodeFrameV2(FrameKindErrorV2, overFrame)

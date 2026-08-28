@@ -582,6 +582,58 @@ func TestStoreV2_Expire(t *testing.T) {
 	}
 }
 
+func TestStoreV2_ExpireUsesInjectedDurations(t *testing.T) {
+	s, clock := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	s.SetExpiryDurations(40*time.Millisecond, 80*time.Millisecond)
+	if s.disconnectGrace() != 40*time.Millisecond || s.tombstoneTTL() != 80*time.Millisecond {
+		t.Fatalf("injected grace=%s tomb=%s", s.disconnectGrace(), s.tombstoneTTL())
+	}
+
+	mustRegisterNodeV2(t, s, storeOtherNodeV2, storeOtherRegV2)
+	s.MarkNodeDisconnected(storeOtherNodeV2)
+	clock.Advance(39 * time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.AllocateSession(storeOtherNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err != nil {
+		t.Fatalf("custom grace not elapsed: %v", err)
+	}
+	s.MarkNodeDisconnected(storeOtherNodeV2)
+	clock.Advance(40*time.Millisecond + time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.AllocateSession(storeOtherNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err == nil {
+		t.Fatal("expected not_registered after injected grace")
+	} else {
+		requireCodeV2(t, err, ErrNotRegisteredV2)
+	}
+
+	closeSess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	closeReq := SessionCommandV2{
+		RequestID: mustUUIDV2(t),
+		Command:   SessionCommandCloseV2,
+		IdentityV2: IdentityV2{
+			SessionID:    closeSess.SessionID,
+			ConnectionID: "conn-0",
+			Epoch:        1,
+		},
+	}
+	if _, err := s.BindSession(storeClientNodeV2, closeReq); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(79 * time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.BindSession(storeClientNodeV2, closeReq); err != nil {
+		t.Fatalf("custom tombstone still live: %v", err)
+	}
+	clock.Advance(80*time.Millisecond + time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, closeSess)); err == nil {
+		t.Fatal("injected tombstone should be gone")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+}
+
 func TestStoreV2_UnregisteredAndPeerErrors(t *testing.T) {
 	s, _ := newTestStoreV2(t)
 	if _, err := s.AllocateSession(storeClientNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err == nil {

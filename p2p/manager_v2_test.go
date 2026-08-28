@@ -801,6 +801,38 @@ func TestManagerV2_ConnectionLimitPerSession(t *testing.T) {
 	}
 }
 
+func TestManagerV2_ExpireWorkerUsesInjectedGrace(t *testing.T) {
+	s, m := startManagerV2(t, Config{})
+	wantGrace := NodeDisconnectGraceDuration(DefaultClientPingInterval, DefaultClientPingMax)
+	wantTomb := TombstoneDuration(DefaultSetupTimeoutV2)
+	if m.v2.store.disconnectGrace() != wantGrace || m.v2.store.tombstoneTTL() != wantTomb {
+		t.Fatalf("production store grace=%s tomb=%s want %s/%s",
+			m.v2.store.disconnectGrace(), m.v2.store.tombstoneTTL(), wantGrace, wantTomb)
+	}
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	m.v2.store.SetExpiryDurations(30*time.Millisecond, 60*time.Millisecond)
+	cids, err := m.lookupNamedAgentConns(mgrClientNodeV2)
+	if err != nil || len(cids) != 1 {
+		t.Fatalf("cid: %v %v", err, cids)
+	}
+	m.injectV2DisconnectFrom(m.serverID, mgrClientNodeV2, cids[0])
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := m.v2.store.AllocateSession(mgrClientNodeV2, CreateSessionCommandV2{
+			RequestID:     mustUUIDV2(t),
+			ServerNodeKey: mgrServerNodeV2,
+		}); err != nil {
+			requireCodeV2(t, err, ErrNotRegisteredV2)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("production Expire worker did not drop node after injected grace")
+}
+
 func TestManagerV2_SessionCloseTombstone(t *testing.T) {
 	s, _ := startManagerV2(t, Config{})
 	client := agentConn(t, s, mgrClientNodeV2)
