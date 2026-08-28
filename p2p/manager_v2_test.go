@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -653,5 +654,307 @@ func TestValidateTotalTimeoutMsV2(t *testing.T) {
 	d, err := ValidateTotalTimeoutMsV2(DefaultSetupTimeoutV2.Milliseconds())
 	if err != nil || d != DefaultSetupTimeoutV2 {
 		t.Fatalf("got %s err=%v", d, err)
+	}
+}
+
+func TestManagerV2_OpenRestartBindReadyConnectionOrder(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	ident, _ := mustCreateBindReadySessionV2(t, client, srv, clientEv, serverEv)
+
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvConnSubj, err := CommandSubjectV2(mgrServerNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	openGot := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, IdentityV2{
+		SessionID: ident.SessionID,
+	}, 0))
+	openAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, openGot.Data)
+	if err != nil {
+		t.Fatalf("OPEN ALLOCATED: %v body=%s", err, openGot.Data)
+	}
+	if openAlloc.Allocated.ConnectionID != "conn-1" || openAlloc.Allocated.Epoch != 1 || openAlloc.Allocated.State != string(ConnectionStateAllocatedV2) {
+		t.Fatalf("open allocated %+v", openAlloc.Allocated)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+
+	openIdent := IdentityV2{
+		SessionID:    openAlloc.Allocated.SessionID,
+		ConnectionID: openAlloc.Allocated.ConnectionID,
+		Epoch:        openAlloc.Allocated.Epoch,
+	}
+	_ = requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandBindV2, openIdent, openAlloc.Allocated.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	if cPrep.Prepare.ConnectionID != "conn-1" || sPrep.Prepare.ConnectionID != "conn-1" {
+		t.Fatalf("open prepare client=%+v server=%+v", cPrep.Prepare, sPrep.Prepare)
+	}
+
+	_ = requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, openIdent, cPrep.Prepare.Revision))
+	_ = requestV2(t, srv, srvConnSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, openIdent, sPrep.Prepare.Revision))
+	cStart := nextEventV2(t, clientEv, FrameKindStartV2)
+	sStart := nextEventV2(t, serverEv, FrameKindStartV2)
+	if cStart.Start.ConnectionID != "conn-1" || sStart.Start.ConnectionID != "conn-1" {
+		t.Fatalf("open start client=%+v server=%+v", cStart.Start, sStart.Start)
+	}
+
+	restartGot := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandRestartV2, ident, cStart.Start.Revision))
+	restartAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, restartGot.Data)
+	if err != nil {
+		t.Fatalf("RESTART ALLOCATED: %v body=%s", err, restartGot.Data)
+	}
+	if restartAlloc.Allocated.ConnectionID != "conn-0" || restartAlloc.Allocated.Epoch != 2 || restartAlloc.Allocated.State != string(ConnectionStateAllocatedV2) {
+		t.Fatalf("restart allocated %+v", restartAlloc.Allocated)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+
+	oldReady := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, restartAlloc.Allocated.Revision))
+	if mustErrorV2(t, oldReady.Data).Code != ErrStaleEpochV2 {
+		t.Fatalf("old-epoch READY: %s", oldReady.Data)
+	}
+	oldClose := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandCloseV2, ident, restartAlloc.Allocated.Revision))
+	if mustErrorV2(t, oldClose.Data).Code != ErrStaleEpochV2 {
+		t.Fatalf("old-epoch CLOSE: %s", oldClose.Data)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+
+	restartIdent := IdentityV2{SessionID: ident.SessionID, ConnectionID: "conn-0", Epoch: 2}
+	_ = requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandBindV2, restartIdent, restartAlloc.Allocated.Revision))
+	rPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	if rPrep.Prepare.Epoch != 2 || rPrep.Prepare.ConnectionID != "conn-0" {
+		t.Fatalf("restart prepare %+v", rPrep.Prepare)
+	}
+	_ = nextEventV2(t, serverEv, FrameKindPrepareV2)
+}
+
+func TestManagerV2_ConnectionLimitPerSession(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	other := agentConn(t, s, mgrOtherNodeV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, other, s.ID(), mgrOtherNodeV2, mgrOtherRegV2)
+
+	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	got := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := alloc.Allocated.SessionID
+	connSubj, _ := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	for i := 1; i < v2MaxConnections; i++ {
+		id := IdentityV2{SessionID: sessionID, ConnectionID: fmt.Sprintf("conn-%d", i)}
+		openGot := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, id, 0))
+		openAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, openGot.Data)
+		if err != nil {
+			t.Fatalf("OPEN conn-%d: %v body=%s", i, err, openGot.Data)
+		}
+		if openAlloc.Allocated.ConnectionID != id.ConnectionID {
+			t.Fatalf("OPEN proposed id %+v", openAlloc.Allocated)
+		}
+	}
+
+	over := IdentityV2{SessionID: sessionID, ConnectionID: "conn-128"}
+	limitGot := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, over, 0))
+	payload := errorPayloadMapV2(t, limitGot.Data)
+	if payload["error"] != string(ErrConnectionLimitV2) {
+		t.Fatalf("limit error=%v body=%s", payload["error"], limitGot.Data)
+	}
+	if payload["session_id"] != sessionID {
+		t.Fatalf("limit session=%v want %s", payload["session_id"], sessionID)
+	}
+	if payload["connection_id"] != "conn-128" {
+		t.Fatalf("requested connection=%v", payload["connection_id"])
+	}
+	if limitVal(payload["limit"]) != v2MaxConnections {
+		t.Fatalf("limit=%v want %d body=%s", payload["limit"], v2MaxConnections, limitGot.Data)
+	}
+
+	otherCreate, _ := CommandSubjectV2(mgrOtherNodeV2, "SESSION.CREATE")
+	otherGot := requestV2(t, other, otherCreate, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	otherAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, otherGot.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherConn, _ := CommandSubjectV2(mgrOtherNodeV2, "CONNECTION.COMMAND")
+	otherOpen := requestV2(t, other, otherConn, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, IdentityV2{
+		SessionID: otherAlloc.Allocated.SessionID,
+	}, 0))
+	if _, err := DecodeFrameV2(FrameKindAllocatedV2, otherOpen.Data); err != nil {
+		t.Fatalf("other session OPEN blocked by limit: %v body=%s", err, otherOpen.Data)
+	}
+}
+
+func TestManagerV2_SessionCloseTombstone(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	ident, rev := mustCreateBindReadySessionV2(t, client, srv, clientEv, serverEv)
+	sessSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connSubj, _ := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+
+	closeReply := requestV2(t, client, sessSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandCloseV2, ident, rev))
+	if _, err := DecodeFrameV2(FrameKindErrorV2, closeReply.Data); err == nil {
+		t.Fatalf("SESSION.CLOSE error: %s", closeReply.Data)
+	}
+	cClose := nextPayloadV2(t, clientEv)
+	sClose := nextPayloadV2(t, serverEv)
+	if cClose["session_id"] != ident.SessionID || sClose["session_id"] != ident.SessionID {
+		t.Fatalf("CLOSE events client=%v server=%v", cClose, sClose)
+	}
+
+	repeat := requestV2(t, client, sessSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandCloseV2, ident, rev))
+	if _, err := DecodeFrameV2(FrameKindErrorV2, repeat.Data); err == nil {
+		t.Fatalf("repeat CLOSE not idempotent: %s", repeat.Data)
+	}
+
+	lateOpen := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, IdentityV2{
+		SessionID: ident.SessionID,
+	}, 0))
+	lateAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, lateOpen.Data)
+	if err != nil {
+		t.Fatalf("late OPEN: %v body=%s", err, lateOpen.Data)
+	}
+	if lateAlloc.Allocated.State != string(SessionStateClosedV2) || lateAlloc.Allocated.SessionID != ident.SessionID {
+		t.Fatalf("late OPEN must return closed, not recreate: %+v", lateAlloc.Allocated)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+
+	lateReady := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, rev))
+	if closedStateV2(t, lateReady.Data) != string(SessionStateClosedV2) {
+		t.Fatalf("late READY must return closed: %s", lateReady.Data)
+	}
+	lateBind := requestV2(t, client, sessSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, rev))
+	if closedStateV2(t, lateBind.Data) != string(SessionStateClosedV2) {
+		t.Fatalf("late BIND must return closed: %s", lateBind.Data)
+	}
+}
+
+func mustCreateBindReadySessionV2(t *testing.T, client, srv *nats.Conn, clientEv, serverEv <-chan *nats.Msg) (IdentityV2, uint64) {
+	t.Helper()
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{
+		SessionID:    alloc.Allocated.SessionID,
+		ConnectionID: alloc.Allocated.ConnectionID,
+		Epoch:        alloc.Allocated.Epoch,
+	}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	readySubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvReadySubj, err := CommandSubjectV2(mgrServerNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = requestV2(t, client, readySubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, cPrep.Prepare.Revision))
+	_ = requestV2(t, srv, srvReadySubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, sPrep.Prepare.Revision))
+	cStart := nextEventV2(t, clientEv, FrameKindStartV2)
+	_ = nextEventV2(t, serverEv, FrameKindStartV2)
+	return ident, cStart.Start.Revision
+}
+
+func assertNoEventV2(t *testing.T, ch <-chan *nats.Msg) {
+	t.Helper()
+	select {
+	case extra := <-ch:
+		t.Fatalf("unexpected event: %s", extra.Data)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func nextPayloadV2(t *testing.T, ch <-chan *nats.Msg) map[string]any {
+	t.Helper()
+	select {
+	case msg := <-ch:
+		return envelopePayloadMapV2(t, msg.Data)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for event")
+		return nil
+	}
+}
+
+func errorPayloadMapV2(t *testing.T, data []byte) map[string]any {
+	t.Helper()
+	return envelopePayloadMapV2(t, data)
+}
+
+func envelopePayloadMapV2(t *testing.T, data []byte) map[string]any {
+	t.Helper()
+	var env EnvelopeV2
+	if err := json.Unmarshal(data, &env); err != nil {
+		t.Fatalf("envelope: %v body=%s", err, data)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		t.Fatalf("payload: %v body=%s", err, env.Payload)
+	}
+	return payload
+}
+
+func closedStateV2(t *testing.T, data []byte) string {
+	t.Helper()
+	payload := envelopePayloadMapV2(t, data)
+	if state, _ := payload["state"].(string); state != "" {
+		return state
+	}
+	if payload["error"] != nil {
+		t.Fatalf("expected closed state, got error payload %s", data)
+	}
+	return ""
+}
+
+func limitVal(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	default:
+		return 0
 	}
 }

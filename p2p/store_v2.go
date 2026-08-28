@@ -347,7 +347,9 @@ func (s *StoreV2) AllocateConnection(sender string, cmd ConnectionCommandV2) (Co
 		return ConnectionSnapshotV2{}, codeErrV2(ErrNotSessionMemberV2)
 	}
 	if sess.state == SessionStateClosedV2 || sess.state == SessionStateFailedV2 {
-		return ConnectionSnapshotV2{}, codeErrV2(ErrInvalidStateV2)
+		snap := closedConnSnapV2(sess, cmd.ConnectionID)
+		s.requests[key] = requestRecordV2{conn: snap, sessionID: sess.id, hasConn: true}
+		return snap, nil
 	}
 	if len(sess.connections) >= s.maxConns {
 		return ConnectionSnapshotV2{}, codeErrV2(ErrConnectionLimitV2)
@@ -399,8 +401,10 @@ func (s *StoreV2) AllocateRestart(sender string, cmd ConnectionCommandV2) (Conne
 	if !ok {
 		return ConnectionSnapshotV2{}, codeErrV2(ErrConnectionNotFoundV2)
 	}
-	if conn.state == ConnectionStateClosedV2 {
-		return ConnectionSnapshotV2{}, codeErrV2(ErrInvalidStateV2)
+	if sess.state == SessionStateClosedV2 || sess.state == SessionStateFailedV2 || conn.state == ConnectionStateClosedV2 {
+		snap := closedConnSnapV2(sess, cmd.ConnectionID)
+		s.requests[key] = requestRecordV2{conn: snap, sessionID: sess.id, hasConn: true}
+		return snap, nil
 	}
 	if cmd.Epoch != 0 {
 		if cmd.Epoch < conn.epoch {
@@ -441,6 +445,9 @@ func (s *StoreV2) BindConnection(sender string, cmd ConnectionCommandV2) ([]Even
 	}
 	if conn.state != ConnectionStateAllocatedV2 && conn.state != ConnectionStateRestartingV2 {
 		return nil, codeErrV2(ErrInvalidStateV2)
+	}
+	if cmd.Revision != 0 && cmd.Revision != sess.revision {
+		return nil, codeErrV2(ErrStaleRevisionV2)
 	}
 	sess.revision++
 	conn.state = ConnectionStatePreparingV2
@@ -550,10 +557,22 @@ func (s *StoreV2) requireSession(id string) (*sessionRecordV2, error) {
 	if sess, ok := s.sessions[id]; ok {
 		return sess, nil
 	}
-	if _, ok := s.tombs[id]; ok {
-		return nil, codeErrV2(ErrSessionNotFoundV2)
+	if sess, ok := s.tombs[id]; ok && sess.state == SessionStateClosedV2 {
+		return sess, nil
 	}
 	return nil, codeErrV2(ErrSessionNotFoundV2)
+}
+
+func (s *StoreV2) PeekSession(id string) (SessionSnapshotV2, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess, ok := s.sessions[id]; ok {
+		return sessionSnapV2(sess), true
+	}
+	if sess, ok := s.tombs[id]; ok {
+		return sessionSnapV2(sess), true
+	}
+	return SessionSnapshotV2{}, false
 }
 
 func (s *StoreV2) requireMemberConn(sender string, cmd ConnectionCommandV2) (*sessionRecordV2, *connectionRecordV2, error) {
@@ -593,7 +612,7 @@ func (s *StoreV2) checkEpoch(sess *sessionRecordV2, connID string, epoch uint64)
 
 func (s *StoreV2) closeSessionLocked(sess *sessionRecordV2) []EventV2 {
 	if sess.state == SessionStateClosedV2 {
-		return cloneEventsV2(sess.closeEvents)
+		return nil
 	}
 	sess.revision++
 	sess.state = SessionStateClosedV2
@@ -799,6 +818,25 @@ func connSnapV2(sess *sessionRecordV2, conn *connectionRecordV2) ConnectionSnaps
 		State:        conn.state,
 		Revision:     sess.revision,
 	}
+}
+
+func closedConnSnapV2(sess *sessionRecordV2, connID string) ConnectionSnapshotV2 {
+	conn := sess.connections[connID]
+	if conn == nil {
+		conn = sess.connections["conn-0"]
+	}
+	if conn == nil {
+		return ConnectionSnapshotV2{
+			SessionID:    sess.id,
+			ConnectionID: "conn-0",
+			Epoch:        1,
+			State:        ConnectionStateClosedV2,
+			Revision:     sess.revision,
+		}
+	}
+	snap := connSnapV2(sess, conn)
+	snap.State = ConnectionStateClosedV2
+	return snap
 }
 
 func nextConnIDV2(sess *sessionRecordV2) string {

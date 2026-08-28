@@ -620,6 +620,27 @@ func TestStoreV2_CloseConnection(t *testing.T) {
 	}
 }
 
+func TestStoreV2_BindConnectionRequiresRevision(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	sess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	open, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-1", 0, sess.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-1", open.Epoch, open.Revision-1)); err == nil {
+		t.Fatal("expected stale_revision")
+	} else {
+		requireCodeV2(t, err, ErrStaleRevisionV2)
+	}
+	ev, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-1", open.Epoch, open.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBothKindsV2(t, ev, FrameKindPrepareV2)
+}
+
 func TestStoreV2_ConcurrentSessions(t *testing.T) {
 	s, _ := newTestStoreV2(t)
 	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
@@ -782,16 +803,33 @@ func TestStoreV2_TombstoneRequestLifecycle(t *testing.T) {
 		t.Fatalf("CREATE during tombstone state %s, want closed", replay.State)
 	}
 
+	repeatClose := SessionCommandV2{
+		RequestID:  mustUUIDV2(t),
+		Command:    SessionCommandCloseV2,
+		IdentityV2: closeReq.IdentityV2,
+	}
+	if _, err := s.BindSession(storeClientNodeV2, repeatClose); err != nil {
+		t.Fatalf("repeat CLOSE must be idempotent: %v", err)
+	}
+
+	lateOpen, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, snap.SessionID, "conn-1", 0, snap.Revision))
+	if err != nil {
+		t.Fatalf("late OPEN during tombstone: %v", err)
+	}
+	if lateOpen.State != ConnectionStateClosedV2 || lateOpen.SessionID != snap.SessionID {
+		t.Fatalf("late OPEN must return closed, not recreate: %+v", lateOpen)
+	}
+
 	lateBind := sessionBindCmdV2(t, snap)
 	if _, err := s.BindSession(storeClientNodeV2, lateBind); err == nil {
 		t.Fatal("late BIND during tombstone must not recreate")
 	} else {
-		requireCodeV2(t, err, ErrSessionNotFoundV2)
+		requireCodeV2(t, err, ErrInvalidStateV2)
 	}
 	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, snap.Revision)); err == nil {
 		t.Fatal("late READY during tombstone must not recreate")
 	} else {
-		requireCodeV2(t, err, ErrSessionNotFoundV2)
+		requireCodeV2(t, err, ErrInvalidStateV2)
 	}
 	if _, err := s.BindSession(storeClientNodeV2, bind); err != nil {
 		t.Fatal(err)

@@ -294,10 +294,13 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 	defer unlock()
 	events, err := m.v2.store.BindSession(sender, cmd)
 	if err != nil {
+		if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
+			return
+		}
 		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
 		return
 	}
-	if err := m.publishPrepareV2(events); err != nil {
+	if err := m.publishEventsV2(events); err != nil {
 		m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 		return
 	}
@@ -311,27 +314,95 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 		return
 	}
 	cmd := *dec.Connection
-	if cmd.Command != ConnectionCommandReadyV2 {
-		m.replyV2Error(msg, cmd.RequestID, ErrInvalidStateV2, nil)
-		return
-	}
 	unlock := m.lockSessionV2(cmd.SessionID)
 	defer unlock()
-	events, err := m.v2.store.MarkConnectionReady(sender, cmd)
-	if err != nil {
-		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
-		return
-	}
-	for _, ev := range events {
-		if err := m.publishV2Event(ev.TargetNodeKey, ev); err != nil {
+	switch cmd.Command {
+	case ConnectionCommandOpenV2:
+		snap, err := m.v2.store.AllocateConnection(sender, cmd)
+		if err != nil {
+			m.replyConnectionAllocErrV2(msg, cmd, err)
+			return
+		}
+		m.replyAllocatedV2(msg, cmd.RequestID, snap)
+	case ConnectionCommandRestartV2:
+		snap, err := m.v2.store.AllocateRestart(sender, cmd)
+		if err != nil {
+			m.replyConnectionAllocErrV2(msg, cmd, err)
+			return
+		}
+		m.replyAllocatedV2(msg, cmd.RequestID, snap)
+	case ConnectionCommandBindV2:
+		events, err := m.v2.store.BindConnection(sender, cmd)
+		if err != nil {
+			if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
+				return
+			}
+			m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+			return
+		}
+		if err := m.publishEventsV2(events); err != nil {
 			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 			return
 		}
+		m.replyV2OK(msg, cmd.RequestID)
+	case ConnectionCommandReadyV2:
+		events, err := m.v2.store.MarkConnectionReady(sender, cmd)
+		if err != nil {
+			if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
+				return
+			}
+			m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+			return
+		}
+		if err := m.publishEventsV2(events); err != nil {
+			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
+			return
+		}
+		m.replyV2OK(msg, cmd.RequestID)
+	case ConnectionCommandCloseV2:
+		events, err := m.v2.store.CloseConnection(sender, cmd)
+		if err != nil {
+			if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
+				return
+			}
+			m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+			return
+		}
+		if err := m.publishEventsV2(events); err != nil {
+			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
+			return
+		}
+		m.replyV2OK(msg, cmd.RequestID)
+	default:
+		m.replyV2Error(msg, cmd.RequestID, ErrInvalidStateV2, nil)
 	}
-	m.replyV2OK(msg, cmd.RequestID)
+}
+
+func (m *Manager) publishEventsV2(events []EventV2) error {
+	var prepares []EventV2
+	var others []EventV2
+	for _, ev := range events {
+		if ev.Kind == FrameKindPrepareV2 {
+			prepares = append(prepares, ev)
+		} else {
+			others = append(others, ev)
+		}
+	}
+	if err := m.publishPrepareV2(prepares); err != nil {
+		return err
+	}
+	for _, ev := range others {
+		if err := m.publishV2Event(ev.TargetNodeKey, ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *Manager) publishPrepareV2(events []EventV2) error {
+	if len(events) == 0 {
+		return nil
+	}
 	var turn *TurnCredV2
 	if len(events) > 0 {
 		turn = m.issueTurnV2At(events[0].Identity, m.now())
@@ -402,6 +473,16 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 			"connection_id":   start.ConnectionID,
 			"epoch":           start.Epoch,
 			"revision":        start.Revision,
+			"sender_node_key": v2CoordinatorSender,
+		}
+		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
+	case FrameKindCloseV2:
+		payload := map[string]any{
+			"session_id":      event.Identity.SessionID,
+			"connection_id":   event.Identity.ConnectionID,
+			"epoch":           event.Identity.Epoch,
+			"revision":        event.Revision,
+			"state":           string(SessionStateClosedV2),
 			"sender_node_key": v2CoordinatorSender,
 		}
 		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
@@ -485,6 +566,79 @@ func (m *Manager) lockSessionV2(sessionID string) func() {
 	mu := v.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
+}
+
+func (m *Manager) replyAllocatedV2(msg *nats.Msg, requestID string, snap ConnectionSnapshotV2) {
+	body, err := encodeEnvelopeV2(requestID, "", "", map[string]any{
+		"ok":              true,
+		"session_id":      snap.SessionID,
+		"connection_id":   snap.ConnectionID,
+		"epoch":           snap.Epoch,
+		"state":           snap.State,
+		"revision":        snap.Revision,
+		"owner_server_id": m.serverID,
+	})
+	if err != nil {
+		m.replyV2Error(msg, requestID, ErrInternalErrorV2, nil)
+		return
+	}
+	_ = msg.Respond(body)
+}
+
+func (m *Manager) replyConnectionAllocErrV2(msg *nats.Msg, cmd ConnectionCommandV2, err error) {
+	if protocolCodeV2(err) == ErrConnectionLimitV2 {
+		m.replyV2ErrorDetail(msg, cmd.RequestID, ErrConnectionLimitV2, map[string]any{
+			"session_id":    cmd.SessionID,
+			"connection_id": cmd.ConnectionID,
+			"limit":         v2MaxConnections,
+		})
+		return
+	}
+	if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
+		return
+	}
+	m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+}
+
+func (m *Manager) replyIfClosedV2(msg *nats.Msg, requestID string, id IdentityV2) bool {
+	snap, ok := m.v2.store.PeekSession(id.SessionID)
+	if !ok || snap.State != SessionStateClosedV2 {
+		return false
+	}
+	connID := id.ConnectionID
+	if connID == "" {
+		connID = snap.ConnectionID
+	}
+	epoch := id.Epoch
+	if epoch == 0 {
+		epoch = snap.Epoch
+	}
+	m.replyAllocatedV2(msg, requestID, ConnectionSnapshotV2{
+		SessionID:    snap.SessionID,
+		ConnectionID: connID,
+		Epoch:        epoch,
+		State:        ConnectionStateClosedV2,
+		Revision:     snap.Revision,
+	})
+	return true
+}
+
+func (m *Manager) replyV2ErrorDetail(msg *nats.Msg, requestID string, code ErrorCodeV2, extra map[string]any) {
+	if requestID == "" {
+		requestID = requestIDFromData(msg.Data)
+	}
+	if ValidateUUIDV2(requestID) != nil {
+		requestID = "00000000-0000-4000-8000-000000000001"
+	}
+	payload := map[string]any{"error": code}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	body, err := encodeEnvelopeV2(requestID, "", "", payload)
+	if err != nil {
+		return
+	}
+	_ = msg.Respond(body)
 }
 
 func (m *Manager) replyV2OK(msg *nats.Msg, requestID string) {
