@@ -271,6 +271,81 @@ func TestV2Protocol_ErrorPayloadFields(t *testing.T) {
 	if dec.Error.Revision == nil || *dec.Error.Revision != 9 {
 		t.Fatalf("revision=%v", dec.Error.Revision)
 	}
+	if dec.Error.SessionID != "" || dec.Error.ConnectionID != "" || dec.Error.Limit != nil {
+		t.Fatalf("unexpected detail fields %+v", dec.Error)
+	}
+}
+
+func TestV2Protocol_ErrorPayloadConnectionLimit(t *testing.T) {
+	type tc struct {
+		name    string
+		payload string
+		valid   bool
+		code    ErrorCodeV2
+		session string
+		conn    string
+		limit   int
+	}
+	cases := []tc{
+		{
+			name:    "manager_connection_limit",
+			payload: `{"error":"connection_limit","session_id":"` + testSessionIDV2 + `","connection_id":"conn-128","limit":128}`,
+			valid:   true,
+			code:    ErrConnectionLimitV2,
+			session: testSessionIDV2,
+			conn:    "conn-128",
+			limit:   128,
+		},
+		{
+			name:    "busy_without_detail_still_ok",
+			payload: `{"error":"busy","retry_after_ms":250}`,
+			valid:   true,
+			code:    ErrBusyV2,
+		},
+		{
+			name:    "limit_present_not_128",
+			payload: `{"error":"connection_limit","session_id":"` + testSessionIDV2 + `","connection_id":"conn-128","limit":64}`,
+			valid:   false,
+		},
+		{
+			name:    "invalid_session_id",
+			payload: `{"error":"connection_limit","session_id":"not-a-uuid","connection_id":"conn-128","limit":128}`,
+			valid:   false,
+		},
+		{
+			name:    "invalid_connection_id",
+			payload: `{"error":"connection_limit","session_id":"` + testSessionIDV2 + `","connection_id":"bad-id","limit":128}`,
+			valid:   false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{"version":2,"request_id":"` + testRequestIDV2 + `","payload":` + c.payload + `}`
+			dec, err := DecodeFrameV2(FrameKindErrorV2, []byte(body))
+			if !c.valid {
+				requireInvalidRequestV2(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dec == nil || dec.Error == nil || dec.Error.Code != c.code {
+				t.Fatalf("got %+v", dec)
+			}
+			if dec.Error.SessionID != c.session || dec.Error.ConnectionID != c.conn {
+				t.Fatalf("ids session=%q conn=%q", dec.Error.SessionID, dec.Error.ConnectionID)
+			}
+			if c.limit == 0 {
+				if dec.Error.Limit != nil {
+					t.Fatalf("limit=%v", dec.Error.Limit)
+				}
+				return
+			}
+			if dec.Error.Limit == nil || *dec.Error.Limit != c.limit {
+				t.Fatalf("limit=%v want %d", dec.Error.Limit, c.limit)
+			}
+		})
+	}
 }
 
 func TestV2Protocol_Enums(t *testing.T) {

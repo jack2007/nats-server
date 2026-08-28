@@ -772,18 +772,18 @@ func TestManagerV2_ConnectionLimitPerSession(t *testing.T) {
 
 	over := IdentityV2{SessionID: sessionID, ConnectionID: "conn-128"}
 	limitGot := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, over, 0))
-	payload := errorPayloadMapV2(t, limitGot.Data)
-	if payload["error"] != string(ErrConnectionLimitV2) {
-		t.Fatalf("limit error=%v body=%s", payload["error"], limitGot.Data)
+	perr := mustErrorV2(t, limitGot.Data)
+	if perr.Code != ErrConnectionLimitV2 {
+		t.Fatalf("limit error=%s body=%s", perr.Code, limitGot.Data)
 	}
-	if payload["session_id"] != sessionID {
-		t.Fatalf("limit session=%v want %s", payload["session_id"], sessionID)
+	if perr.SessionID != sessionID {
+		t.Fatalf("limit session=%s want %s", perr.SessionID, sessionID)
 	}
-	if payload["connection_id"] != "conn-128" {
-		t.Fatalf("requested connection=%v", payload["connection_id"])
+	if perr.ConnectionID != "conn-128" {
+		t.Fatalf("requested connection=%s", perr.ConnectionID)
 	}
-	if limitVal(payload["limit"]) != v2MaxConnections {
-		t.Fatalf("limit=%v want %d body=%s", payload["limit"], v2MaxConnections, limitGot.Data)
+	if perr.Limit == nil || *perr.Limit != v2MaxConnections {
+		t.Fatalf("limit=%v want %d body=%s", perr.Limit, v2MaxConnections, limitGot.Data)
 	}
 
 	otherCreate, _ := CommandSubjectV2(mgrOtherNodeV2, "SESSION.CREATE")

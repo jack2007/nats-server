@@ -224,6 +224,9 @@ type ErrorPayloadV2 struct {
 	Code         ErrorCodeV2 `json:"error"`
 	RetryAfterMs *int64      `json:"retry_after_ms,omitempty"`
 	Revision     *uint64     `json:"revision,omitempty"`
+	SessionID    string      `json:"session_id,omitempty"`
+	ConnectionID string      `json:"connection_id,omitempty"`
+	Limit        *int        `json:"limit,omitempty"`
 }
 
 type DecodedV2 struct {
@@ -791,6 +794,19 @@ func decodeErrorV2(env EnvelopeV2) (*ErrorPayloadV2, error) {
 		return nil, err
 	}
 	if _, ok := knownErrorCodesV2[payload.Code]; !ok {
+		return nil, invalidRequestV2()
+	}
+	if payload.SessionID != "" {
+		if err := ValidateUUIDV2(payload.SessionID); err != nil {
+			return nil, err
+		}
+	}
+	if payload.ConnectionID != "" {
+		if err := ValidateConnectionIDV2(payload.ConnectionID); err != nil {
+			return nil, err
+		}
+	}
+	if payload.Limit != nil && *payload.Limit != 128 {
 		return nil, invalidRequestV2()
 	}
 	return &payload, nil
