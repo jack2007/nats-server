@@ -1,7 +1,9 @@
 # nats-p2p Auth Callout 补充测试设计
 
 日期：2026-08-22  
-状态：已批准（用户要求落地 P0+P1）  
+状态：历史 V1 测试基线；Callout 管道负例继续有效，V1 subject 权限、REGISTER/CREATE
+和 invite 断言将在 V2 实施时由 raypx2 仓库的
+`docs/superpowers/specs/2026-08-28-nats-p2p-v2-multi-session-design.md` 对应测试取代。
 主规格：`docs/superpowers/specs/2026-08-22-nats-p2p-auth-callout-design.md`  
 对照：公网切 Callout 时 `auth-internal` 过窄 `permissions` 导致全部 CONNECT 在 `authorization.timeout` 后失败（回包 subject 为 `$SYS._INBOX.*`）。
 

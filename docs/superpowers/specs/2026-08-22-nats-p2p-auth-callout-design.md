@@ -1,7 +1,10 @@
 # nats-p2p Auth Callout 设计
 
 日期：2026-08-22  
-状态：已批准  
+状态：历史 V1 鉴权基线；CONNECT credential/Callout 管道继续有效，V1 `$P2P.*`
+权限签发规则已由 raypx2 仓库的
+`docs/superpowers/specs/2026-08-28-nats-p2p-v2-multi-session-design.md` 取代。V2 完成切换
+前，本文仍描述当前 master。
 仓库：`nats-server`（包装进程 `cmd/nats-p2p-server` + `p2p/`）  
 对照：`docs/superpowers/specs/2026-08-21-nats-p2p-ice-signaling-design.md`  
 Agent 侧：`~/src/raypx2/docs/superpowers/specs/2026-08-22-nats-auth-callout-design.md`

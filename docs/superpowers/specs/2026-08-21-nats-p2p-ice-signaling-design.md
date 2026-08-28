@@ -1,7 +1,9 @@
 # nats-server P2P ICE 信令设计
 
 日期：2026-08-21  
-状态：待实现  
+状态：历史 V1 设计；目标架构已由 raypx2 仓库的
+`docs/superpowers/specs/2026-08-28-nats-p2p-v2-multi-session-design.md` 取代。V2 完成切换
+前，本文仍用于解释当前 master 的 V1 行为，不作为新实现依据。
 仓库：`nats-server`（P2P 为旁路包，不改 `server/` 内核）
 
 修订：同日改为 **Go 库嵌入**——包装进程用公开 API 嵌入 `nats-server`，`$P2P` 在独立包中以 NATS 客户端实现。不再把占用表/TURN 做进 `server/*.go`，也不再走 cluster route 私有协议。
