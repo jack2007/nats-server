@@ -28,6 +28,59 @@
       }
     },
     {
+      "name": "register_reply_ok",
+      "kind": "REGISTER.REPLY",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {
+          "registration_epoch": 1
+        }
+      }
+    },
+    {
+      "name": "register_reply_missing_epoch",
+      "kind": "REGISTER.REPLY",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {}
+      }
+    },
+    {
+      "name": "register_reply_zero_epoch",
+      "kind": "REGISTER.REPLY",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {
+          "registration_epoch": 0
+        }
+      }
+    },
+    {
+      "name": "register_reply_invalid_registration_id",
+      "kind": "REGISTER.REPLY",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "registration_id": "0123456789ABCDEF0123456789ABCDEF",
+        "payload": {
+          "registration_epoch": 1
+        }
+      }
+    },
+    {
       "name": "create_ok",
       "kind": "SESSION.CREATE",
       "valid": true,

@@ -347,6 +347,63 @@ func TestV2Protocol_GoldenVectors(t *testing.T) {
 	}
 }
 
+func TestV2Protocol_RegisterReply(t *testing.T) {
+	type tc struct {
+		name  string
+		body  string
+		want  bool
+		epoch uint64
+	}
+	cases := []tc{
+		{
+			name:  "valid_echo_id_and_epoch",
+			body:  `{"version":2,"request_id":"` + testRequestIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{"registration_epoch":1}}`,
+			want:  true,
+			epoch: 1,
+		},
+		{
+			name: "missing_epoch",
+			body: `{"version":2,"request_id":"` + testRequestIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{}}`,
+		},
+		{
+			name: "zero_epoch",
+			body: `{"version":2,"request_id":"` + testRequestIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{"registration_epoch":0}}`,
+		},
+		{
+			name: "invalid_registration_id",
+			body: `{"version":2,"request_id":"` + testRequestIDV2 + `","registration_id":"0123456789ABCDEF0123456789ABCDEF","payload":{"registration_epoch":1}}`,
+		},
+		{
+			name: "missing_registration_id",
+			body: `{"version":2,"request_id":"` + testRequestIDV2 + `","payload":{"registration_epoch":1}}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dec, err := DecodeFrameV2(FrameKindRegisterReplyV2, []byte(c.body))
+			if c.want {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if dec == nil || dec.RegisterReply == nil {
+					t.Fatalf("decoded=%v", dec)
+				}
+				if dec.RegisterReply.RegistrationID != testRegIDV2 {
+					t.Fatalf("registration_id=%q", dec.RegisterReply.RegistrationID)
+				}
+				if dec.RegisterReply.RegistrationEpoch != c.epoch {
+					t.Fatalf("registration_epoch=%d", dec.RegisterReply.RegistrationEpoch)
+				}
+				if dec.RegisterReply.RequestID != testRequestIDV2 {
+					t.Fatalf("request_id=%q", dec.RegisterReply.RequestID)
+				}
+				return
+			}
+			requireInvalidRequestV2(t, err)
+		})
+	}
+}
+
 func TestV2Protocol_ConnectionOpenIdentity(t *testing.T) {
 	type tc struct {
 		name    string

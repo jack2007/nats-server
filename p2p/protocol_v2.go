@@ -66,6 +66,7 @@ const (
 
 const (
 	FrameKindRegisterV2          FrameKindV2 = "REGISTER"
+	FrameKindRegisterReplyV2     FrameKindV2 = "REGISTER.REPLY"
 	FrameKindCreateV2            FrameKindV2 = "SESSION.CREATE"
 	FrameKindSessionCommandV2    FrameKindV2 = "SESSION.COMMAND"
 	FrameKindConnectionCommandV2 FrameKindV2 = "CONNECTION.COMMAND"
@@ -140,6 +141,12 @@ func invalidRequestV2() error {
 type RegisterCommandV2 struct {
 	RequestID      string
 	RegistrationID string
+}
+
+type RegisterReplyV2 struct {
+	RequestID         string
+	RegistrationID    string
+	RegistrationEpoch uint64
 }
 
 type CreateSessionCommandV2 struct {
@@ -218,18 +225,19 @@ type ErrorPayloadV2 struct {
 }
 
 type DecodedV2 struct {
-	Envelope   EnvelopeV2
-	Kind       FrameKindV2
-	Register   *RegisterCommandV2
-	Create     *CreateSessionCommandV2
-	Session    *SessionCommandV2
-	Connection *ConnectionCommandV2
-	SignalSend *SignalSendCommandV2
-	SignalAck  *SignalAckCommandV2
-	Allocated  *AllocatedReplyV2
-	Prepare    *PrepareEventV2
-	Start      *StartEventV2
-	Error      *ErrorPayloadV2
+	Envelope      EnvelopeV2
+	Kind          FrameKindV2
+	Register      *RegisterCommandV2
+	RegisterReply *RegisterReplyV2
+	Create        *CreateSessionCommandV2
+	Session       *SessionCommandV2
+	Connection    *ConnectionCommandV2
+	SignalSend    *SignalSendCommandV2
+	SignalAck     *SignalAckCommandV2
+	Allocated     *AllocatedReplyV2
+	Prepare       *PrepareEventV2
+	Start         *StartEventV2
+	Error         *ErrorPayloadV2
 }
 
 var (
@@ -395,6 +403,12 @@ func DecodeFrameV2(kind FrameKindV2, data []byte) (*DecodedV2, error) {
 			return nil, err
 		}
 		out.Register = cmd
+	case FrameKindRegisterReplyV2:
+		cmd, err := decodeRegisterReplyV2(env)
+		if err != nil {
+			return nil, err
+		}
+		out.RegisterReply = cmd
 	case FrameKindCreateV2:
 		cmd, err := decodeCreateV2(env)
 		if err != nil {
@@ -467,6 +481,29 @@ func decodeRegisterV2(env EnvelopeV2) (*RegisterCommandV2, error) {
 		return nil, err
 	}
 	return &RegisterCommandV2{RequestID: env.RequestID, RegistrationID: env.RegistrationID}, nil
+}
+
+func decodeRegisterReplyV2(env EnvelopeV2) (*RegisterReplyV2, error) {
+	if err := requireRequestIDV2(env.RequestID); err != nil {
+		return nil, err
+	}
+	if err := ValidateRegistrationIDV2(env.RegistrationID); err != nil {
+		return nil, err
+	}
+	var payload struct {
+		RegistrationEpoch uint64 `json:"registration_epoch"`
+	}
+	if err := decodeStrictV2(env.Payload, &payload); err != nil {
+		return nil, err
+	}
+	if payload.RegistrationEpoch == 0 {
+		return nil, invalidRequestV2()
+	}
+	return &RegisterReplyV2{
+		RequestID:         env.RequestID,
+		RegistrationID:    env.RegistrationID,
+		RegistrationEpoch: payload.RegistrationEpoch,
+	}, nil
 }
 
 func decodeCreateV2(env EnvelopeV2) (*CreateSessionCommandV2, error) {
