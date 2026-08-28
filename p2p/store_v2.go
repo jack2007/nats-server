@@ -483,8 +483,7 @@ func (s *StoreV2) Expire(now time.Time) []EventV2 {
 		if sess.state != SessionStateActiveV2 {
 			continue
 		}
-		var expired []string
-		for id, conn := range sess.connections {
+		for _, conn := range sess.connections {
 			if conn.state != ConnectionStateAllocatedV2 && conn.state != ConnectionStatePreparingV2 {
 				continue
 			}
@@ -492,10 +491,6 @@ func (s *StoreV2) Expire(now time.Time) []EventV2 {
 				continue
 			}
 			events = append(events, s.failConnectionLocked(sess, conn)...)
-			expired = append(expired, id)
-		}
-		for _, id := range expired {
-			delete(sess.connections, id)
 		}
 	}
 	for key, n := range s.nodes {

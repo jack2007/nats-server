@@ -697,7 +697,17 @@ func TestStoreV2_ExpireActiveSessionConnectionSetupDeadline(t *testing.T) {
 	if _, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-1", open.Epoch, open.Revision)); err == nil {
 		t.Fatal("expired OPEN generation should not bind")
 	} else {
-		requireCodeV2(t, err, ErrConnectionNotFoundV2)
+		requireCodeV2(t, err, ErrInvalidStateV2)
+	}
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sess.SessionID, "conn-1", open.Epoch, open.Revision)); err == nil {
+		t.Fatal("expired OPEN generation should not ready")
+	} else {
+		requireCodeV2(t, err, ErrInvalidStateV2)
+	}
+	if _, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-1", 0, sessionRevisionV2(t, s, sess.SessionID))); err == nil {
+		t.Fatal("timed-out connection_id should still occupy its slot")
+	} else {
+		requireCodeV2(t, err, ErrInvalidStateV2)
 	}
 
 	again, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-2", 0, sessionRevisionV2(t, s, sess.SessionID)))
@@ -706,6 +716,31 @@ func TestStoreV2_ExpireActiveSessionConnectionSetupDeadline(t *testing.T) {
 	}
 	if again.ConnectionID != "conn-2" || again.State != ConnectionStateAllocatedV2 {
 		t.Fatalf("new OPEN snapshot %+v", again)
+	}
+
+	restart, err := s.AllocateRestart(storeClientNodeV2, connCmdV2(t, ConnectionCommandRestartV2, sess.SessionID, "conn-0", 1, again.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev = restart.Revision
+	for i := 3; i < storeMaxConnsV2; i++ {
+		openN, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, fmt.Sprintf("conn-%d", i), 0, rev))
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		rev = openN.Revision
+	}
+	clock.Advance(DefaultSetupTimeoutV2 + time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-0", restart.Epoch, restart.Revision)); err == nil {
+		t.Fatal("expired RESTART generation should not drop conn-0")
+	} else {
+		requireCodeV2(t, err, ErrInvalidStateV2)
+	}
+	if _, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-128", 0, sessionRevisionV2(t, s, sess.SessionID))); err == nil {
+		t.Fatal("expected connection_limit after 128 distinct IDs including timed-out")
+	} else {
+		requireCodeV2(t, err, ErrConnectionLimitV2)
 	}
 }
 
