@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -13,76 +14,85 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("c", "", "config file")
-	flag.Parse()
-	raw, err := os.ReadFile(*cfgPath)
-	if err != nil {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	if err := run(os.Args[1:], ch); err != nil {
 		log.Fatal(err)
 	}
-	natsRaw, pcfg, has, err := p2p.SplitP2PBlock(raw)
+}
+
+func run(args []string, stop <-chan os.Signal) error {
+	fs := flag.NewFlagSet("nats-p2p-server", flag.ContinueOnError)
+	cfgPath := fs.String("c", "", "config file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(*cfgPath)
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	natsRaw, pcfg, _, err := p2p.SplitP2PBlock(raw)
+	if err != nil {
+		return err
+	}
+	if err := p2p.ValidateConfig(pcfg); err != nil {
+		return err
 	}
 	tmp, err := os.CreateTemp("", "nats-p2p-*.conf")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	if _, err := tmp.Write(natsRaw); err != nil {
-		log.Fatal(err)
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
 	}
 	tmp.Close()
 	opts, err := server.ProcessConfigFile(tmp.Name())
 	os.Remove(tmp.Name())
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	p2p.ApplyClientPingDefaults(opts, natsRaw)
-	if has {
-		if err := p2p.ValidateConfig(pcfg); err != nil {
-			log.Fatal(err)
-		}
-	}
 	s, err := server.NewServer(opts)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	s.Start()
 	if !s.ReadyForConnections(10 * time.Second) {
-		log.Fatal("nats-server not ready")
+		s.Shutdown()
+		return fmt.Errorf("nats-server not ready")
 	}
 	var auth *p2p.AuthCalloutService
 	if opts.AuthCallout != nil {
 		if err := p2p.CheckIssuer(opts.AuthCallout.Issuer); err != nil {
-			log.Fatal(err)
+			s.Shutdown()
+			return err
 		}
 		user, pass, err := p2p.AuthInternalCredentials(opts)
 		if err != nil {
-			log.Fatal(err)
+			s.Shutdown()
+			return err
 		}
 		auth, err = p2p.StartAuthCallout(s, user, pass)
 		if err != nil {
-			log.Fatal(err)
+			s.Shutdown()
+			return err
 		}
 	}
-	var m *p2p.Manager
-	if has {
-		var err error
-		m, err = p2p.StartManager(s, pcfg)
-		if err != nil {
-			if auth != nil {
-				auth.Stop()
-			}
-			log.Fatal(err)
+	m, err := p2p.StartManager(s, pcfg)
+	if err != nil {
+		if auth != nil {
+			auth.Stop()
 		}
+		s.Shutdown()
+		return err
 	}
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	<-ch
-	if m != nil {
-		m.Stop()
-	}
+	<-stop
+	m.Stop()
 	if auth != nil {
 		auth.Stop()
 	}
 	s.Shutdown()
+	return nil
 }

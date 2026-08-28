@@ -41,6 +41,8 @@ type Manager struct {
 	clusterStop chan struct{}
 
 	countNamed func(name string) (int, error)
+
+	v2 *managerV2
 }
 
 type createReply struct {
@@ -128,6 +130,15 @@ func StartManager(s *server.Server, cfg Config) (*Manager, error) {
 		nc.Close()
 		return nil, err
 	}
+	if err := m.startV2(); err != nil {
+		m.stopV2()
+		m.stopCluster()
+		if m.sysNC != nil {
+			m.sysNC.Close()
+		}
+		nc.Close()
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -135,6 +146,7 @@ func (m *Manager) Stop() {
 	if m == nil {
 		return
 	}
+	m.stopV2()
 	m.stopCluster()
 	if m.sysNC != nil {
 		_ = m.sysNC.Drain()
