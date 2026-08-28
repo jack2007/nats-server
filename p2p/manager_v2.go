@@ -78,6 +78,7 @@ type managerV2 struct {
 	retryMu         sync.Mutex
 	retries         map[MessageKeyV2]signalRetryItemV2
 	retryWake       chan struct{}
+	stats           v2Stats
 }
 
 func RetryAfterMsV2(attempt int) int64 {
@@ -155,6 +156,9 @@ func (m *Manager) startV2() error {
 	go m.signalRetryLoopV2()
 	m.v2.wg.Add(1)
 	go m.expireLoopV2()
+	if err := m.startMonitorV2(); err != nil {
+		return err
+	}
 	if catchErr != nil {
 		return m.nc.Flush()
 	}
@@ -353,11 +357,13 @@ func (m *Manager) handleRegisterV2(msg *nats.Msg, sender, suffix string) {
 func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 	dec, err := DecodeFrameV2(FrameKindCreateV2, msg.Data)
 	if err != nil {
+		m.noteCreateV2("error")
 		m.replyV2Error(msg, requestIDFromData(msg.Data), protocolCodeV2(err), nil)
 		return
 	}
 	if dec.Create.TotalTimeoutMs != 0 {
 		if _, err := ValidateTotalTimeoutMsV2(dec.Create.TotalTimeoutMs); err != nil {
+			m.noteCreateV2("error")
 			m.replyV2Error(msg, dec.Create.RequestID, ErrInvalidRequestV2, nil)
 			return
 		}
@@ -383,6 +389,7 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 	peer, err := m.lookupPeerCreateOwnerV2(sender, dec.Create.RequestID)
 	if err != nil {
 		ms := RetryAfterMsV2(0)
+		m.noteCreateV2("busy")
 		m.replyV2Error(msg, dec.Create.RequestID, ErrBusyV2, &ms)
 		return
 	}
@@ -392,6 +399,7 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 	}
 	snap, err := m.v2.store.AllocateSession(sender, *dec.Create)
 	if err != nil {
+		m.noteCreateV2("error")
 		m.replyV2Error(msg, dec.Create.RequestID, protocolCodeV2(err), nil)
 		return
 	}
@@ -416,9 +424,14 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 	m.v2.mu.Unlock()
 	if err := m.syncSessionLockedV2(snap.SessionID, dec.Create.RequestID, sender); err != nil {
 		ms := RetryAfterMsV2(0)
+		m.noteRevisionSyncV2(err)
+		m.noteCreateV2("busy")
 		m.replyV2Error(msg, dec.Create.RequestID, ErrBusyV2, &ms)
 		return
 	}
+	m.noteRevisionSyncV2(nil)
+	m.noteCreateV2("ok")
+	m.v2.stats.noteConn(string(ConnectionStateAllocatedV2), "owner", 1)
 	body, err := encodeEnvelopeV2(dec.Create.RequestID, "", "", map[string]any{
 		"ok":              true,
 		"session_id":      snap.SessionID,
@@ -459,7 +472,11 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 		m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 		return
 	}
-	_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
+	if cmd.Command == SessionCommandBindV2 {
+		m.v2.stats.noteConn(string(ConnectionStateAllocatedV2), "owner", -1)
+		m.v2.stats.noteConn(string(ConnectionStatePreparingV2), "owner", 1)
+	}
+	m.noteRevisionSyncV2(m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender))
 	m.replyV2OK(msg, cmd.RequestID)
 }
 
@@ -479,7 +496,8 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyConnectionAllocErrV2(msg, cmd, err)
 			return
 		}
-		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
+		m.v2.stats.noteConn(string(ConnectionStateAllocatedV2), "owner", 1)
+		m.noteRevisionSyncV2(m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender))
 		m.replyAllocatedV2(msg, cmd.RequestID, snap)
 	case ConnectionCommandRestartV2:
 		old := GenerationKeyV2{SessionID: cmd.SessionID, ConnectionID: cmd.ConnectionID, Epoch: cmd.Epoch}
@@ -522,7 +540,14 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 			return
 		}
-		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
+		for _, ev := range events {
+			if ev.Kind == FrameKindStartV2 {
+				m.v2.stats.noteConn(string(ConnectionStatePreparingV2), "owner", -1)
+				m.v2.stats.noteConn(string(ConnectionStateActiveV2), "owner", 1)
+				break
+			}
+		}
+		m.noteRevisionSyncV2(m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender))
 		m.replyV2OK(msg, cmd.RequestID)
 	case ConnectionCommandCloseV2:
 		events, err := m.v2.store.CloseConnection(sender, cmd)
@@ -556,13 +581,17 @@ func (m *Manager) handleSignalSendV2(msg *nats.Msg, sender string) {
 	target, ev, err := m.v2.store.AcceptSignal(sender, cmd)
 	unlock()
 	if err != nil {
+		m.v2.stats.noteSignal(string(cmd.Type), "rx", "error")
 		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
 		return
 	}
+	m.v2.stats.noteSignal(string(cmd.Type), "rx", "ok")
 	m.replyV2Accepted(msg, cmd.RequestID)
 	if ev.MessageID == "" {
+		m.v2.stats.signalDedup.Add(1)
 		return
 	}
+	m.v2.stats.noteSignal(string(cmd.Type), "tx", "ok")
 	m.enqueueSignalRetryV2(signalRetryItemV2{
 		dir: DirectionKeyV2{
 			GenerationKeyV2: GenerationKeyV2{SessionID: ev.Identity.SessionID, ConnectionID: ev.Identity.ConnectionID, Epoch: ev.Identity.Epoch},
@@ -618,6 +647,9 @@ func (m *Manager) enqueueSignalRetryV2(item signalRetryItemV2) {
 	m.v2.retryMu.Lock()
 	if _, ok := m.v2.retries[key]; !ok {
 		m.v2.retries[key] = item
+		m.v2.stats.signalRetry.Add(1)
+	} else {
+		m.v2.stats.signalDedup.Add(1)
 	}
 	m.v2.retryMu.Unlock()
 	m.wakeSignalRetryV2()
@@ -1023,6 +1055,7 @@ func (m *Manager) replyAllocatedV2(msg *nats.Msg, requestID string, snap Connect
 
 func (m *Manager) replyConnectionAllocErrV2(msg *nats.Msg, cmd ConnectionCommandV2, err error) {
 	if protocolCodeV2(err) == ErrConnectionLimitV2 {
+		m.v2.stats.connLimit.Add(1)
 		m.replyV2ErrorDetail(msg, cmd.RequestID, ErrConnectionLimitV2, map[string]any{
 			"session_id":    cmd.SessionID,
 			"connection_id": cmd.ConnectionID,
