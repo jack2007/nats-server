@@ -831,6 +831,19 @@ func TestStoreV2_TombstoneRequestLifecycle(t *testing.T) {
 	} else {
 		requireCodeV2(t, err, ErrInvalidStateV2)
 	}
+	lateResume := SessionCommandV2{
+		RequestID:  mustUUIDV2(t),
+		Command:    SessionCommandResumeV2,
+		IdentityV2: closeReq.IdentityV2,
+	}
+	if _, err := s.BindSession(storeClientNodeV2, lateResume); err == nil {
+		t.Fatal("late RESUME during tombstone must not succeed")
+	} else {
+		requireCodeV2(t, err, ErrInvalidStateV2)
+	}
+	if peeked, ok := s.PeekSession(snap.SessionID); !ok || peeked.State != SessionStateClosedV2 {
+		t.Fatalf("RESUME must not revive tomb: ok=%v snap=%+v", ok, peeked)
+	}
 	if _, err := s.BindSession(storeClientNodeV2, bind); err != nil {
 		t.Fatal(err)
 	}

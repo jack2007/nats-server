@@ -853,6 +853,22 @@ func TestManagerV2_SessionCloseTombstone(t *testing.T) {
 	if closedStateV2(t, lateBind.Data) != string(SessionStateClosedV2) {
 		t.Fatalf("late BIND must return closed: %s", lateBind.Data)
 	}
+	lateResume := requestV2(t, client, sessSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandResumeV2, ident, rev))
+	if closedStateV2(t, lateResume.Data) != string(SessionStateClosedV2) {
+		t.Fatalf("late RESUME must return closed: %s", lateResume.Data)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+	lateOpenAgain := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, IdentityV2{
+		SessionID: ident.SessionID,
+	}, 0))
+	lateAllocAgain, err := DecodeFrameV2(FrameKindAllocatedV2, lateOpenAgain.Data)
+	if err != nil {
+		t.Fatalf("OPEN after RESUME: %v body=%s", err, lateOpenAgain.Data)
+	}
+	if lateAllocAgain.Allocated.State != string(SessionStateClosedV2) || lateAllocAgain.Allocated.SessionID != ident.SessionID {
+		t.Fatalf("RESUME must not revive session: %+v", lateAllocAgain.Allocated)
+	}
 }
 
 func mustCreateBindReadySessionV2(t *testing.T, client, srv *nats.Conn, clientEv, serverEv <-chan *nats.Msg) (IdentityV2, uint64) {

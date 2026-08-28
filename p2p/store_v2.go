@@ -284,6 +284,9 @@ func (s *StoreV2) BindSession(sender string, cmd SessionCommandV2) ([]EventV2, e
 		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 		return events, nil
 	case SessionCommandResumeV2:
+		if sess.state == SessionStateClosedV2 {
+			return nil, codeErrV2(ErrInvalidStateV2)
+		}
 		s.requests[key] = requestRecordV2{sessionID: sess.id, hasEv: true}
 		return nil, nil
 	default:
