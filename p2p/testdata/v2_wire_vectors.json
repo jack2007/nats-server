@@ -1,0 +1,564 @@
+{
+  "protocol_version": 2,
+  "identities": {
+    "node_key": "client-a",
+    "server_node_key": "server-b",
+    "server_id": "NCUOD3RJC5AEUIOLGR2CJ6B3FD3JQ7RS35TTAPC2NO75RQYAQFHNGGUY",
+    "user_nkey": "UC2WHO4K2FFSONOOFYWBFXVSEYN2IUMTYTWUF2APBFNSBZPMBXM6BPVQ",
+    "registration_id": "0123456789abcdef0123456789abcdef",
+    "request_id": "550e8400-e29b-41d4-a716-446655440000",
+    "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "connection_id": "conn-0",
+    "epoch": 1,
+    "seq": 3,
+    "ack_seq": 3,
+    "revision": 1
+  },
+  "cases": [
+    {
+      "name": "register_ok",
+      "kind": "REGISTER",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {}
+      }
+    },
+    {
+      "name": "create_ok",
+      "kind": "SESSION.CREATE",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "server_node_key": "server-b"
+        }
+      }
+    },
+    {
+      "name": "session_bind_ok",
+      "kind": "SESSION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "BIND",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "session_resume_ok",
+      "kind": "SESSION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "RESUME",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "revision": 1
+        }
+      }
+    },
+    {
+      "name": "session_close_ok",
+      "kind": "SESSION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "CLOSE",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "connection_open_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "OPEN",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-1",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "connection_restart_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "RESTART",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "connection_ready_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "READY",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "signal_send_candidate_ok",
+      "kind": "SIGNAL.SEND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 3,
+          "type": "candidate",
+          "payload": {
+            "candidate": "candidate:1 1 UDP 2130706431 192.0.2.1 3478 typ host"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_send_description_ok",
+      "kind": "SIGNAL.SEND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 1,
+          "type": "description",
+          "payload": {
+            "sdp": "v=0"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_send_eoc_ok",
+      "kind": "SIGNAL.SEND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 18446744073709551615,
+          "seq": 18446744073709551615,
+          "type": "end_of_candidates",
+          "payload": {}
+        }
+      }
+    },
+    {
+      "name": "signal_ack_ok",
+      "kind": "SIGNAL.ACK",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "ack_seq": 3
+        }
+      }
+    },
+    {
+      "name": "allocated_ok",
+      "kind": "ALLOCATED",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "ok": true,
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "state": "allocated",
+          "revision": 1,
+          "owner_server_id": "NCUOD3RJC5AEUIOLGR2CJ6B3FD3JQ7RS35TTAPC2NO75RQYAQFHNGGUY"
+        }
+      }
+    },
+    {
+      "name": "prepare_ok",
+      "kind": "PREPARE",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "revision": 1,
+          "role": "client",
+          "peer_node_key": "server-b",
+          "sender_node_key": "coordinator",
+          "stun_urls": ["stun:turn.example.com:3478"],
+          "turn": {
+            "urls": ["turn:turn.example.com:3478?transport=udp"],
+            "username": "user",
+            "password": "secret",
+            "expires_at": 1780000000
+          },
+          "setup_deadline_ms": 15000,
+          "protocol_version": 2,
+          "feature_bits": 1
+        }
+      }
+    },
+    {
+      "name": "start_ok",
+      "kind": "START",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "revision": 2,
+          "sender_node_key": "coordinator"
+        }
+      }
+    },
+    {
+      "name": "error_busy_ok",
+      "kind": "ERROR",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "error": "busy",
+          "retry_after_ms": 100,
+          "revision": 3
+        }
+      }
+    },
+    {
+      "name": "register_missing_request_id",
+      "kind": "REGISTER",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {}
+      }
+    },
+    {
+      "name": "session_command_missing_request_id",
+      "kind": "SESSION.COMMAND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "payload": {
+          "command": "BIND",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "connection_command_missing_request_id",
+      "kind": "CONNECTION.COMMAND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "payload": {
+          "command": "READY",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "signal_send_missing_request_id",
+      "kind": "SIGNAL.SEND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 3,
+          "type": "candidate",
+          "payload": {
+            "candidate": "x"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_send_missing_message_id",
+      "kind": "SIGNAL.SEND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 3,
+          "type": "candidate",
+          "payload": {
+            "candidate": "x"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_send_missing_seq",
+      "kind": "SIGNAL.SEND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "type": "candidate",
+          "payload": {
+            "candidate": "x"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_ack_missing_request_id",
+      "kind": "SIGNAL.ACK",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "ack_seq": 3
+        }
+      }
+    },
+    {
+      "name": "signal_ack_missing_ack_seq",
+      "kind": "SIGNAL.ACK",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "event_prepare_missing_registration_id",
+      "kind": "PREPARE",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "revision": 1,
+          "role": "client",
+          "peer_node_key": "server-b",
+          "sender_node_key": "coordinator",
+          "stun_urls": ["stun:turn.example.com:3478"],
+          "setup_deadline_ms": 15000,
+          "protocol_version": 2,
+          "feature_bits": 1
+        }
+      }
+    },
+    {
+      "name": "wrong_version",
+      "kind": "SESSION.CREATE",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 1,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "server_node_key": "server-b"
+        }
+      }
+    },
+    {
+      "name": "unknown_field",
+      "kind": "SESSION.CREATE",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "extra": true,
+        "payload": {
+          "server_node_key": "server-b"
+        }
+      }
+    },
+    {
+      "name": "illegal_session_command",
+      "kind": "SESSION.COMMAND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "OPEN",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "illegal_signal_kind",
+      "kind": "SIGNAL.SEND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 1,
+          "type": "invite",
+          "payload": {}
+        }
+      }
+    },
+    {
+      "name": "uppercase_uuid",
+      "kind": "SESSION.CREATE",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550E8400-E29B-41D4-A716-446655440000",
+        "payload": {
+          "server_node_key": "server-b"
+        }
+      }
+    },
+    {
+      "name": "illegal_connection_id",
+      "kind": "CONNECTION.COMMAND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "READY",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-00",
+          "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "uppercase_registration_id",
+      "kind": "REGISTER",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "registration_id": "0123456789ABCDEF0123456789ABCDEF",
+        "payload": {}
+      }
+    },
+    {
+      "name": "signal_send_rejects_sender_node_key",
+      "kind": "SIGNAL.SEND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 3,
+          "type": "candidate",
+          "sender_node_key": "spoofed",
+          "payload": {
+            "candidate": "x"
+          }
+        }
+      }
+    }
+  ]
+}
