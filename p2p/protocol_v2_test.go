@@ -143,7 +143,7 @@ func TestV2Subject_RejectsMalformed(t *testing.T) {
 		"$P2P.V2.CMD.*.SESSION.CREATE",
 		"$P2P.V2.CMD.client-a.>",
 		"$P2P.V2.CMD.client-a.SESSION.CREATE.>",
-		"$P2P.REGISTER",
+		"$P2P.LEGACY.CMD",
 		"$P2P.V2.EVENT.client-a." + testRegIDV2,
 		"$P2P.V2.CMD.client-a.SESSION.*.CREATE",
 		"",

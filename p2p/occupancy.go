@@ -5,6 +5,8 @@ import (
 	"sync"
 )
 
+const CodeNodeKeyInUse = "node_key_in_use"
+
 var ErrNodeKeyInUse = errors.New(CodeNodeKeyInUse)
 
 type Record struct {

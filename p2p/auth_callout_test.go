@@ -92,22 +92,23 @@ func TestAgentPermissionsV2(t *testing.T) {
 	if !hasExactSubject(uc.Pub.Allow, wantCMD) {
 		t.Fatalf("pub allow %v, want %s", []string(uc.Pub.Allow), wantCMD)
 	}
+	if len(uc.Pub.Allow) != 1 || !hasExactSubject(uc.Pub.Allow, wantCMD) {
+		t.Fatalf("pub allow must be exactly %s, got %v", wantCMD, []string(uc.Pub.Allow))
+	}
 	if hasExactSubject(uc.Pub.Allow, "$P2P.V2.CMD.node-b.>") ||
-		hasExactSubject(uc.Pub.Allow, "$P2P.V2.MGR.>") ||
-		hasExactSubject(uc.Pub.Allow, "$P2P.REGISTER") ||
-		hasExactSubject(uc.Pub.Allow, "$P2P.CREATE") ||
-		hasExactSubject(uc.Pub.Allow, "$P2P.UNREGISTER") ||
-		hasExactSubject(uc.Pub.Allow, "$P2P.ICE.>") {
-		t.Fatalf("pub allow must not grant other-node CMD, MGR, or V1 subjects: %v", []string(uc.Pub.Allow))
+		hasExactSubject(uc.Pub.Allow, "$P2P.V2.MGR.>") {
+		t.Fatalf("pub allow must not grant other-node CMD or MGR: %v", []string(uc.Pub.Allow))
 	}
 	if !hasExactSubject(uc.Sub.Allow, wantEVENT) || !hasExactSubject(uc.Sub.Allow, "_INBOX.>") {
 		t.Fatalf("sub allow %v, want %s and _INBOX.>", []string(uc.Sub.Allow), wantEVENT)
 	}
+	if len(uc.Sub.Allow) != 2 {
+		t.Fatalf("sub allow must be exactly EVENT + _INBOX.>, got %v", []string(uc.Sub.Allow))
+	}
 	if hasExactSubject(uc.Sub.Allow, "$P2P.V2.EVENT.node-b.>") ||
 		hasExactSubject(uc.Sub.Allow, "$P2P.V2.MGR.>") ||
-		hasExactSubject(uc.Sub.Allow, "$P2P.NODE.>") ||
-		hasExactSubject(uc.Sub.Allow, "$P2P.ICE.>") {
-		t.Fatalf("sub allow must not grant other-node EVENT, MGR, or V1 subjects: %v", []string(uc.Sub.Allow))
+		hasExactSubject(uc.Sub.Allow, "$P2P.NODE.>") {
+		t.Fatalf("sub allow must not grant other-node EVENT, MGR, or node inbox: %v", []string(uc.Sub.Allow))
 	}
 	if _, err := EncodeAgentUserJWT(pub, ""); err == nil {
 		t.Fatal("empty node key must be rejected")

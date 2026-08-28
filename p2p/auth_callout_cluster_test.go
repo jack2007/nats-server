@@ -1,13 +1,10 @@
 package p2p
 
 import (
-	"bytes"
 	"fmt"
 	"net/url"
 	"testing"
 	"time"
-
-	"github.com/nats-io/nats.go"
 
 	"github.com/nats-io/nats-server/v2/server"
 )
@@ -97,40 +94,25 @@ func startCalloutClusterPair(t *testing.T) (sA, sB *server.Server, authA, authB 
 }
 
 func TestCalloutClusterCreateCrossNode(t *testing.T) {
-	t.Skip("V1 CREATE subjects are no longer granted; Task 8 converts this test to V2")
 	sA, sB, _, _, _, _ := startCalloutClusterPair(t)
-	client := mustConnectAgent(t, sA, "client-a")
-	peer := mustConnectAgent(t, sB, "server-b")
-	invCh := make(chan *nats.Msg, 2)
-	if _, err := client.Subscribe("$P2P.NODE.client-a", func(msg *nats.Msg) { invCh <- msg }); err != nil {
+	client := mustConnectAgent(t, sA, mgrClientNodeV2)
+	peer := mustConnectAgent(t, sB, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	peerEv := subscribeEventsV2(t, peer, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, sA.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, peer, sB.ID(), mgrServerNodeV2, mgrServerRegV2)
+	alloc := createAllocatedOnNodeV2(t, client, mgrClientNodeV2, mgrServerNodeV2)
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.Subscribe("$P2P.NODE.server-b", func(msg *nats.Msg) { invCh <- msg }); err != nil {
-		t.Fatal(err)
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Revision))
+	if nextEventV2(t, clientEv, FrameKindPrepareV2).Prepare.Role != "client" {
+		t.Fatal("client prepare")
 	}
-	time.Sleep(50 * time.Millisecond)
-	if msg := requestP2P(t, client, "$P2P.REGISTER", "client-a", registerBody("client-a")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("client register: %s", msg.Data)
-	}
-	if msg := requestP2P(t, peer, "$P2P.REGISTER", "server-b", registerBody("server-b")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("peer register: %s", msg.Data)
-	}
-	got := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"server-b"}`))
-	if !bytes.Contains(got.Data, []byte(`"ok":true`)) {
-		t.Fatalf("create: %s", got.Data)
-	}
-	seen := 0
-	deadline := time.After(3 * time.Second)
-	for seen < 2 {
-		select {
-		case m := <-invCh:
-			if !bytes.Contains(m.Data, []byte(`"type":"invite"`)) {
-				t.Fatalf("invite: %s", m.Data)
-			}
-			seen++
-		case <-deadline:
-			t.Fatalf("invites=%d", seen)
-		}
+	if nextEventV2(t, peerEv, FrameKindPrepareV2).Prepare.Role != "server" {
+		t.Fatal("server prepare")
 	}
 }
 

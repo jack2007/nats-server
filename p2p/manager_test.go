@@ -1,8 +1,6 @@
 package p2p
 
 import (
-	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,100 +11,73 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 )
 
-func requestP2P(t *testing.T, nc *nats.Conn, subject, name string, data []byte) *nats.Msg {
-	t.Helper()
-	msg := nats.NewMsg(subject)
-	msg.Header.Set("Nats-P2P-Name", name)
-	msg.Data = data
-	got, err := nc.RequestMsg(msg, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return got
-}
-
-func TestRegisterCreateInviteSingleNode(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{
-		STUNURLs: []string{"stun:turn.example.com:3478"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-
-	client := agentConn(t, s, "client-a")
-	server := agentConn(t, s, "server-b")
-	if _, err := client.Subscribe("$P2P.NODE.client-a", func(*nats.Msg) {}); err != nil {
-		t.Fatal(err)
-	}
-	invCh := make(chan *nats.Msg, 2)
-	if _, err := server.Subscribe("$P2P.NODE.server-b", func(msg *nats.Msg) { invCh <- msg }); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.Subscribe("$P2P.NODE.client-a", func(msg *nats.Msg) { invCh <- msg }); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-
-	if msg := requestP2P(t, client, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-	// spec 1: same connection re-REGISTER succeeds
-	if msg := requestP2P(t, client, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("idempotent register: %s", msg.Data)
-	}
-	if msg := requestP2P(t, server, "$P2P.REGISTER", "server-b", []byte(`{"node_key":"server-b"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-	// 第二条连接同一 name
-	dup, err := nats.Connect("", nats.InProcessServer(s), nats.Name("client-a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dup.Close()
-	msg := requestP2P(t, dup, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`))
-	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-	// name mismatch
-	bad := agentConn(t, s, "name-x")
-	msg = requestP2P(t, bad, "$P2P.REGISTER", "name-x", []byte(`{"node_key":"other"}`))
-	if !bytes.Contains(msg.Data, []byte(`name_mismatch`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-
-	got := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"server-b"}`))
-	if !bytes.Contains(got.Data, []byte(`"ok":true`)) || bytes.Contains(got.Data, []byte(`"grant"`)) {
-		t.Fatalf("%s", got.Data)
-	}
-	if !bytes.Contains(got.Data, []byte(`$P2P.ICE.`)) || bytes.Contains(got.Data, []byte(`"turn"`)) {
-		t.Fatalf("need ice_subject and no turn: %s", got.Data)
-	}
-	// 两个 invite
-	deadline := time.After(2 * time.Second)
-	seen := 0
-	for seen < 2 {
-		select {
-		case m := <-invCh:
-			if !bytes.Contains(m.Data, []byte(`"type":"invite"`)) {
-				t.Fatalf("%s", m.Data)
-			}
-			seen++
-		case <-deadline:
-			t.Fatalf("invites=%d", seen)
-		}
-	}
-}
-
-func TestRegisterConcurrentSameNameOneWins(t *testing.T) {
+func TestStartManagerOnlyV2Subscriptions(t *testing.T) {
 	s := startEmbedded(t)
 	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	if m.v2 == nil || m.v2.store == nil {
+		t.Fatal("manager must init V2 store")
+	}
+	assertOnlyV2AndInternalManagerSubjects(t, s, s.ID())
+}
 
+func TestRegisterCreatePrepareSingleNode(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	assertOnlyV2AndInternalManagerSubjects(t, s, s.ID())
+
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	// same connection re-REGISTER is idempotent
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	dup, err := nats.Connect("", nats.InProcessServer(s), nats.Name(mgrClientNodeV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dup.Close()
+	busy := tryRegisterV2(t, dup, s.ID(), mgrClientNodeV2, newRegistrationIDV2(t))
+	if mustErrorV2(t, busy.Data).Code != ErrBusyV2 {
+		t.Fatalf("duplicate name want busy: %s", busy.Data)
+	}
+
+	// subject token is the sender; a mismatched body node is not used
+	bad := agentConn(t, s, "name-x")
+	badSubj, err := RegisterSubjectV2("name-x", s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBad := requestV2(t, bad, badSubj, registerFrameV2(t, mustUUIDV2(t), newRegistrationIDV2(t)))
+	if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, gotBad.Data); err != nil {
+		t.Fatalf("register uses subject token, want reply: %s", gotBad.Data)
+	}
+
+	alloc := createAllocatedOnNodeV2(t, client, mgrClientNodeV2, mgrServerNodeV2)
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	if cPrep.Prepare.Role != "client" || sPrep.Prepare.Role != "server" {
+		t.Fatalf("prepare roles client=%+v server=%+v", cPrep.Prepare, sPrep.Prepare)
+	}
+	if cPrep.Prepare.Turn != nil || sPrep.Prepare.Turn != nil {
+		t.Fatalf("no turn without secret: %+v %+v", cPrep.Prepare.Turn, sPrep.Prepare.Turn)
+	}
+}
+
+func TestRegisterConcurrentSameNameOneWins(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
 	a := agentConn(t, s, "shared-key")
 	b, err := nats.Connect("", nats.InProcessServer(s), nats.Name("shared-key"))
 	if err != nil {
@@ -115,122 +86,87 @@ func TestRegisterConcurrentSameNameOneWins(t *testing.T) {
 	defer b.Close()
 
 	start := make(chan struct{})
-	results := make(chan []byte, 2)
+	results := make(chan ErrorCodeV2, 2)
 	for _, nc := range []*nats.Conn{a, b} {
 		go func(nc *nats.Conn) {
 			<-start
-			msg := nats.NewMsg("$P2P.REGISTER")
-			msg.Header.Set("Nats-P2P-Name", "shared-key")
-			msg.Data = []byte(`{"node_key":"shared-key"}`)
-			got, err := nc.RequestMsg(msg, time.Second)
+			subj, err := RegisterSubjectV2("shared-key", s.ID())
 			if err != nil {
-				results <- []byte(err.Error())
+				results <- ErrInternalErrorV2
 				return
 			}
-			results <- got.Data
+			got, err := nc.Request(subj, registerFrameV2(t, mustUUIDV2(t), newRegistrationIDV2(t)), 2*time.Second)
+			if err != nil {
+				results <- ErrInternalErrorV2
+				return
+			}
+			if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, got.Data); err == nil {
+				results <- ""
+				return
+			}
+			results <- mustErrorV2(t, got.Data).Code
 		}(nc)
 	}
 	close(start)
-	ok, inUse := 0, 0
+	ok, busy := 0, 0
 	for i := 0; i < 2; i++ {
-		data := <-results
-		switch {
-		case bytes.Contains(data, []byte(`"ok":true`)):
+		switch <-results {
+		case "":
 			ok++
-		case bytes.Contains(data, []byte(`node_key_in_use`)):
-			inUse++
+		case ErrBusyV2:
+			busy++
 		default:
-			t.Fatalf("unexpected: %s", data)
+			t.Fatal("expected one register reply and one busy")
 		}
 	}
-	if ok != 1 || inUse != 1 {
-		t.Fatalf("ok=%d in_use=%d (want 1 and 1)", ok, inUse)
+	if ok > 1 || ok+busy != 2 {
+		t.Fatalf("ok=%d busy=%d (never two successes; both busy is ok when connz=2)", ok, busy)
 	}
 }
 
-func TestRegisterConnzFailureIsNodeKeyInUse(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+func TestRegisterConnzNotExactIsBusy(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	c := agentConn(t, s, "solo")
+	mustRegisterV2(t, c, s.ID(), "solo", newRegistrationIDV2(t))
+	dup, err := nats.Connect("", nats.InProcessServer(s), nats.Name("solo"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Stop()
-	c := agentConn(t, s, "solo")
-	if msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-	m.countNamed = func(string) (int, error) {
-		return 0, errConnzUnavailable
-	}
-	msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`))
-	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("want node_key_in_use on connz failure, got %s", msg.Data)
-	}
-}
-
-func TestRegisterConnzFailureUnclaimedReplies(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.countNamed = func(string) (int, error) {
-		return 0, errConnzUnavailable
-	}
-	c := agentConn(t, s, "solo")
-	msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`))
-	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) && !bytes.Contains(msg.Data, []byte(`invalid_request`)) {
-		t.Fatalf("want error reply on unclaimed connz failure, got %s", msg.Data)
-	}
-}
-
-func TestRegisterZeroCountNameMismatch(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.countNamed = func(string) (int, error) {
-		return 0, nil
-	}
-	c := agentConn(t, s, "solo")
-	msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`))
-	if !bytes.Contains(msg.Data, []byte(`name_mismatch`)) && !bytes.Contains(msg.Data, []byte(`invalid_request`)) {
-		t.Fatalf("want name_mismatch/invalid_request, got %s", msg.Data)
+	defer dup.Close()
+	got := tryRegisterV2(t, dup, s.ID(), "solo", newRegistrationIDV2(t))
+	if mustErrorV2(t, got.Data).Code != ErrBusyV2 {
+		t.Fatalf("want busy when connz is not exactly one, got %s", got.Data)
 	}
 }
 
 func TestCreateBeforeRegister(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+	s, _ := startManagerV2(t, Config{})
+	c := agentConn(t, s, "solo")
+	createSubj, err := CommandSubjectV2("solo", "SESSION.CREATE")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Stop()
-	c := agentConn(t, s, "solo")
-	msg := requestP2P(t, c, "$P2P.CREATE", "solo", []byte(`{"peer_node_key":"other"}`))
-	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
-		t.Fatalf("%s", msg.Data)
+	got := requestV2(t, c, createSubj, createFrameV2(t, mustUUIDV2(t), "other"))
+	if mustErrorV2(t, got.Data).Code != ErrNotRegisteredV2 {
+		t.Fatalf("%s", got.Data)
 	}
 }
 
-func TestUnregisterBeforeRegister(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
+func TestCreatePeerNotRegistered(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	c := agentConn(t, s, "solo")
+	mustRegisterV2(t, c, s.ID(), "solo", newRegistrationIDV2(t))
+	createSubj, err := CommandSubjectV2("solo", "SESSION.CREATE")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Stop()
-	c := agentConn(t, s, "solo")
-	msg := requestP2P(t, c, "$P2P.UNREGISTER", "solo", []byte(`{"node_key":"solo"}`))
-	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
-		t.Fatalf("%s", msg.Data)
+	got := requestV2(t, c, createSubj, createFrameV2(t, mustUUIDV2(t), "missing"))
+	if mustErrorV2(t, got.Data).Code != ErrPeerNotRegisteredV2 {
+		t.Fatalf("%s", got.Data)
 	}
 }
 
-func TestCreateDuringPrepareDoesNotInvite(t *testing.T) {
+func TestCreateDuringPendingRegisterDoesNotPrepare(t *testing.T) {
 	s, cfg := startEmbeddedWithAccounts(t)
 	m, err := StartManager(s, cfg)
 	if err != nil {
@@ -238,32 +174,23 @@ func TestCreateDuringPrepareDoesNotInvite(t *testing.T) {
 	}
 	defer m.Stop()
 
-	peer := agentConnApp(t, s, "peer-b")
-	if msg := requestP2P(t, peer, "$P2P.REGISTER", "peer-b", registerBody("peer-b")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("peer register: %s", msg.Data)
-	}
+	peer := agentConnApp(t, s, mgrServerNodeV2)
+	t.Cleanup(peer.Close)
+	mustRegisterV2(t, peer, s.ID(), mgrServerNodeV2, mgrServerRegV2)
 
-	client := agentConnApp(t, s, "client-a")
-	account := testAgentAccount
-	if err := m.table.Claim(account, "client-a", Record{
-		ServerID:  m.serverID,
-		ConnName:  "client-a",
-		Inbox:     "$P2P.NODE.client-a",
-		ClaimID:   "pending-claim",
-		ClaimedAt: 1,
-		Committed: false,
-	}); err != nil {
+	client := agentConnApp(t, s, mgrClientNodeV2)
+	t.Cleanup(client.Close)
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	msg := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"peer-b"}`))
-	if !bytes.Contains(msg.Data, []byte(`not_registered`)) {
-		t.Fatalf("CREATE during PREPARE should fail: %s", msg.Data)
+	got := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	if mustErrorV2(t, got.Data).Code != ErrNotRegisteredV2 {
+		t.Fatalf("CREATE before client register should fail: %s", got.Data)
 	}
 }
 
 func TestConnzAccountIsolation(t *testing.T) {
-	t.Helper()
 	sysAcc := server.NewAccount("SYS")
 	appAcc := server.NewAccount(testAgentAccount)
 	otherAcc := server.NewAccount("OTHER")
@@ -311,38 +238,19 @@ func TestConnzAccountIsolation(t *testing.T) {
 	}
 	defer other.Close()
 	app := agentConnApp(t, s, "shared-key")
+	t.Cleanup(app.Close)
 
-	count, err := m.countConnsNamed("shared-key")
+	cids, err := m.lookupNamedAgentConns("shared-key")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("count=%d want 1 (OTHER account conn must not count)", count)
+	if len(cids) != 1 {
+		t.Fatalf("cids=%d want 1 (OTHER account conn must not count)", len(cids))
 	}
-
-	if msg := requestP2P(t, app, "$P2P.REGISTER", "shared-key", registerBody("shared-key")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("register with same name on app account: %s", msg.Data)
-	}
+	mustRegisterV2(t, app, s.ID(), "shared-key", newRegistrationIDV2(t))
 }
 
-func TestCreatePeerNotRegistered(t *testing.T) {
-	s := startEmbedded(t)
-	m, err := StartManager(s, Config{STUNURLs: []string{"stun:turn.example.com:3478"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	c := agentConn(t, s, "solo")
-	if msg := requestP2P(t, c, "$P2P.REGISTER", "solo", []byte(`{"node_key":"solo"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-	msg := requestP2P(t, c, "$P2P.CREATE", "solo", []byte(`{"peer_node_key":"missing"}`))
-	if !bytes.Contains(msg.Data, []byte(`peer_not_registered`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-}
-
-func TestCreateWithSecretIncludesTurn(t *testing.T) {
+func TestCreateWithSecretIncludesTurnOnPrepare(t *testing.T) {
 	s := startEmbedded(t)
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "secret")
@@ -362,36 +270,32 @@ func TestCreateWithSecretIncludesTurn(t *testing.T) {
 	}
 	defer m.Stop()
 	m.now = func() time.Time { return fixed }
+	m.v2.store.now = func() time.Time { return fixed }
 
-	client := agentConn(t, s, "client-a")
-	peer := agentConn(t, s, "server-b")
-	if _, err := client.Subscribe("$P2P.NODE.client-a", func(*nats.Msg) {}); err != nil {
+	client := agentConn(t, s, mgrClientNodeV2)
+	peer := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	peerEv := subscribeEventsV2(t, peer, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, peer, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	alloc := createAllocatedOnNodeV2(t, client, mgrClientNodeV2, mgrServerNodeV2)
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.Subscribe("$P2P.NODE.server-b", func(*nats.Msg) {}); err != nil {
-		t.Fatal(err)
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, peerEv, FrameKindPrepareV2)
+	if cPrep.Prepare.Turn == nil || cPrep.Prepare.Turn.Username == "" {
+		t.Fatalf("prepare missing turn: %+v", cPrep.Prepare)
 	}
-	time.Sleep(50 * time.Millisecond)
-
-	requestP2P(t, client, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`))
-	requestP2P(t, peer, "$P2P.REGISTER", "server-b", []byte(`{"node_key":"server-b"}`))
-
-	got := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"server-b"}`))
-	var resp struct {
-		OK           bool     `json:"ok"`
-		SessionID    string   `json:"session_id"`
-		ConnectionID string   `json:"connection_id"`
-		Epoch        uint64   `json:"epoch"`
-		Turn         TurnCred `json:"turn"`
+	user, pass := IssueREST(secret, ident.SessionID, ident.ConnectionID, ident.Epoch, fixed.Unix(), int64(DefaultCredentialTTL/time.Second))
+	if cPrep.Prepare.Turn.Username != user || cPrep.Prepare.Turn.Password != pass {
+		t.Fatalf("turn mismatch got=%s/%s want=%s/%s", cPrep.Prepare.Turn.Username, cPrep.Prepare.Turn.Password, user, pass)
 	}
-	if err := json.Unmarshal(got.Data, &resp); err != nil {
-		t.Fatal(err)
-	}
-	if !resp.OK || resp.Turn.Username == "" {
-		t.Fatalf("%s", got.Data)
-	}
-	user, pass := IssueREST(secret, resp.SessionID, resp.ConnectionID, resp.Epoch, fixed.Unix(), int64(DefaultCredentialTTL/time.Second))
-	if resp.Turn.Username != user || resp.Turn.Password != pass {
-		t.Fatalf("turn mismatch got=%s/%s want=%s/%s body=%s", resp.Turn.Username, resp.Turn.Password, user, pass, got.Data)
+	if sPrep.Prepare.Turn.Username != user || sPrep.Prepare.Turn.Password != pass {
+		t.Fatalf("peer turn mismatch %+v", sPrep.Prepare.Turn)
 	}
 }

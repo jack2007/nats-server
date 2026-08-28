@@ -1,8 +1,6 @@
 package p2p
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -199,11 +197,9 @@ func TestTCPCalloutDeniesSysAndWildcard(t *testing.T) {
 }
 
 func TestTCPCalloutCreateIncludesTurn(t *testing.T) {
-	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "secret")
-	secret := []byte("test-static-auth-secret")
-	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+	if err := os.WriteFile(secretPath, []byte("test-static-auth-secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{
@@ -212,51 +208,42 @@ func TestTCPCalloutCreateIncludesTurn(t *testing.T) {
 		SecretFile:    secretPath,
 		CredentialTTL: DefaultCredentialTTL,
 	})
-	client := mustConnectAgent(t, s, "client-a")
-	peer := mustConnectAgent(t, s, "server-b")
-	if _, err := client.Subscribe("$P2P.NODE.client-a", func(*nats.Msg) {}); err != nil {
+	client := mustConnectAgent(t, s, mgrClientNodeV2)
+	peer := mustConnectAgent(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	peerEv := subscribeEventsV2(t, peer, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, peer, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	alloc := createAllocatedOnNodeV2(t, client, mgrClientNodeV2, mgrServerNodeV2)
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.Subscribe("$P2P.NODE.server-b", func(*nats.Msg) {}); err != nil {
-		t.Fatal(err)
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, peerEv, FrameKindPrepareV2)
+	if cPrep.Prepare.Turn == nil || cPrep.Prepare.Turn.Username == "" || len(cPrep.Prepare.StunURLs) == 0 {
+		t.Fatalf("prepare missing turn/stun: %+v", cPrep.Prepare)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if msg := requestP2P(t, client, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("register client: %s", msg.Data)
-	}
-	if msg := requestP2P(t, peer, "$P2P.REGISTER", "server-b", []byte(`{"node_key":"server-b"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("register peer: %s", msg.Data)
-	}
-	got := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"server-b"}`))
-	var resp struct {
-		OK       bool     `json:"ok"`
-		StunURLs []string `json:"stun_urls"`
-		Turn     TurnCred `json:"turn"`
-	}
-	if err := json.Unmarshal(got.Data, &resp); err != nil {
-		t.Fatal(err)
-	}
-	if !resp.OK || resp.Turn.Username == "" || len(resp.StunURLs) == 0 {
-		t.Fatalf("create missing turn/stun: %s", got.Data)
+	if sPrep.Prepare.Turn == nil || sPrep.Prepare.Turn.Username != cPrep.Prepare.Turn.Username {
+		t.Fatalf("peer turn mismatch %+v", sPrep.Prepare.Turn)
 	}
 }
 
 func TestTCPCalloutHardDisconnectWithoutSysKeepsOccupancy(t *testing.T) {
-	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	nc := mustConnectAgent(t, s, "node-z")
-	if msg := requestP2P(t, nc, "$P2P.REGISTER", "node-z", []byte(`{"node_key":"node-z"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("register: %s", msg.Data)
-	}
+	mustRegisterV2(t, nc, s.ID(), "node-z", newRegistrationIDV2(t))
 	nc.Close()
 	nc2, err := connectTCP(s, AgentUser, AgentPassword, "node-z")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { nc2.Close() })
-	msg := requestP2P(t, nc2, "$P2P.REGISTER", "node-z", []byte(`{"node_key":"node-z"}`))
-	if !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("connz reclaim without sys must allow reregister, got %s", msg.Data)
+	got := tryRegisterV2(t, nc2, s.ID(), "node-z", newRegistrationIDV2(t))
+	if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, got.Data); err != nil {
+		t.Fatalf("connz reclaim without sys must allow reregister, got %s", got.Data)
 	}
 }
 
@@ -293,29 +280,21 @@ func TestCalloutStartFailsClosed(t *testing.T) {
 }
 
 func TestTCPCalloutTwoNodeKeysShareCreds(t *testing.T) {
-	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	a := mustConnectAgent(t, s, "key-a")
 	b := mustConnectAgent(t, s, "key-b")
-	if msg := requestP2P(t, a, "$P2P.REGISTER", "key-a", []byte(`{"node_key":"key-a"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
-	if msg := requestP2P(t, b, "$P2P.REGISTER", "key-b", []byte(`{"node_key":"key-b"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
+	mustRegisterV2(t, a, s.ID(), "key-a", newRegistrationIDV2(t))
+	mustRegisterV2(t, b, s.ID(), "key-b", newRegistrationIDV2(t))
 }
 
 func TestTCPCalloutDuplicateNodeKeyInUse(t *testing.T) {
-	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	a := mustConnectAgent(t, s, "shared-key")
-	if msg := requestP2P(t, a, "$P2P.REGISTER", "shared-key", []byte(`{"node_key":"shared-key"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("%s", msg.Data)
-	}
+	mustRegisterV2(t, a, s.ID(), "shared-key", newRegistrationIDV2(t))
 	dup := mustConnectAgent(t, s, "shared-key")
-	msg := requestP2P(t, dup, "$P2P.REGISTER", "shared-key", []byte(`{"node_key":"shared-key"}`))
-	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("%s", msg.Data)
+	got := tryRegisterV2(t, dup, s.ID(), "shared-key", newRegistrationIDV2(t))
+	if mustErrorV2(t, got.Data).Code != ErrBusyV2 {
+		t.Fatalf("%s", got.Data)
 	}
 }
 
@@ -373,10 +352,10 @@ func TestAuthCalloutTCPConnectNameSubjectScopeV2(t *testing.T) {
 		return err
 	})
 	expectPermissionsViolation(t, a, func() error {
-		return a.Publish("$P2P.REGISTER", []byte("x"))
+		return a.Publish("$P2P.MGR.PREPARE", []byte("x"))
 	})
 	expectPermissionsViolation(t, a, func() error {
-		_, err := a.Subscribe("$P2P.NODE.node-a", func(*nats.Msg) {})
+		_, err := a.Subscribe("$P2P.MGR.>", func(*nats.Msg) {})
 		return err
 	})
 }
@@ -403,7 +382,6 @@ func expectPermissionsViolation(t *testing.T, nc *nats.Conn, op func() error) {
 }
 
 func TestTCPCalloutLeftoverAppAccountStaysOnGlobal(t *testing.T) {
-	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	conf := fmt.Sprintf(`
 listen: "127.0.0.1:-1"
 accounts {
@@ -433,7 +411,5 @@ authorization {
 	}
 	s, _, _ := startTCPCalloutFromConf(t, conf, true, Config{})
 	nc := mustConnectAgent(t, s, "client-a")
-	if msg := requestP2P(t, nc, "$P2P.REGISTER", "client-a", []byte(`{"node_key":"client-a"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("register on leftover APP conf: %s", msg.Data)
-	}
+	mustRegisterV2(t, nc, s.ID(), "client-a", newRegistrationIDV2(t))
 }

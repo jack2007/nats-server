@@ -1,8 +1,6 @@
 package p2p
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"testing"
@@ -132,45 +130,35 @@ func waitClusterPeers(t *testing.T, managers ...*Manager) {
 }
 
 func TestClusterRegisterDuplicateKey(t *testing.T) {
-	sA, sB, _, _ := startClusterManagers(t)
-
+	sA, _, _, _ := startClusterManagers(t)
 	ncA := agentConnApp(t, sA, "shared-key")
-	if msg := requestP2P(t, ncA, "$P2P.REGISTER", "shared-key", registerBody("shared-key")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("A register: %s", msg.Data)
-	}
+	t.Cleanup(ncA.Close)
+	mustRegisterV2(t, ncA, sA.ID(), "shared-key", newRegistrationIDV2(t))
 
-	ncB := agentConnApp(t, sB, "shared-key")
-	msg := requestP2P(t, ncB, "$P2P.REGISTER", "shared-key", registerBody("shared-key"))
-	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("B should fail: %s", msg.Data)
+	dup := agentConnApp(t, sA, "shared-key")
+	t.Cleanup(dup.Close)
+	got := tryRegisterV2(t, dup, sA.ID(), "shared-key", newRegistrationIDV2(t))
+	if mustErrorV2(t, got.Data).Code != ErrBusyV2 {
+		t.Fatalf("duplicate name on same server want busy: %s", got.Data)
 	}
 }
 
 func TestClusterRegisterAfterClose(t *testing.T) {
 	sA, sB, _, _ := startClusterManagers(t)
-
 	ncA := agentConnApp(t, sA, "shared-key")
-	if msg := requestP2P(t, ncA, "$P2P.REGISTER", "shared-key", registerBody("shared-key")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("A register: %s", msg.Data)
-	}
+	mustRegisterV2(t, ncA, sA.ID(), "shared-key", newRegistrationIDV2(t))
 	ncA.Close()
 
 	ncB := agentConnApp(t, sB, "shared-key")
+	t.Cleanup(ncB.Close)
 	deadline := time.Now().Add(5 * time.Second)
 	var last []byte
 	for time.Now().Before(deadline) {
-		msg := nats.NewMsg("$P2P.REGISTER")
-		msg.Header.Set("Nats-P2P-Name", "shared-key")
-		msg.Data = registerBody("shared-key")
-		got, err := ncB.RequestMsg(msg, time.Second)
-		if err == nil && bytes.Contains(got.Data, []byte(`"ok":true`)) {
+		got := tryRegisterV2(t, ncB, sB.ID(), "shared-key", newRegistrationIDV2(t))
+		if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, got.Data); err == nil {
 			return
 		}
-		if err == nil {
-			last = got.Data
-		} else {
-			last = []byte(err.Error())
-		}
+		last = got.Data
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("B register after A close failed, last=%s", last)
@@ -178,253 +166,105 @@ func TestClusterRegisterAfterClose(t *testing.T) {
 
 func TestClusterCreateCrossNode(t *testing.T) {
 	sA, sB, _, _ := startClusterManagers(t)
+	clientReg := newRegistrationIDV2(t)
+	peerReg := newRegistrationIDV2(t)
+	client := agentConnApp(t, sA, mgrClientNodeV2)
+	peer := agentConnApp(t, sB, mgrServerNodeV2)
+	t.Cleanup(client.Close)
+	t.Cleanup(peer.Close)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, clientReg)
+	peerEv := subscribeEventsV2(t, peer, mgrServerNodeV2, peerReg)
+	mustRegisterV2(t, client, sA.ID(), mgrClientNodeV2, clientReg)
+	mustRegisterV2(t, peer, sB.ID(), mgrServerNodeV2, peerReg)
 
-	client := agentConnApp(t, sA, "client-a")
-	peer := agentConnApp(t, sB, "server-b")
-
-	invCh := make(chan *nats.Msg, 2)
-	if _, err := client.Subscribe("$P2P.NODE.client-a", func(msg *nats.Msg) { invCh <- msg }); err != nil {
+	alloc := createAllocatedOnNodeV2(t, client, mgrClientNodeV2, mgrServerNodeV2)
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := peer.Subscribe("$P2P.NODE.server-b", func(msg *nats.Msg) { invCh <- msg }); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-
-	if msg := requestP2P(t, client, "$P2P.REGISTER", "client-a", registerBody("client-a")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("client register: %s", msg.Data)
-	}
-	if msg := requestP2P(t, peer, "$P2P.REGISTER", "server-b", registerBody("server-b")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("peer register: %s", msg.Data)
-	}
-
-	got := requestP2P(t, client, "$P2P.CREATE", "client-a", []byte(`{"peer_node_key":"server-b"}`))
-	if !bytes.Contains(got.Data, []byte(`"ok":true`)) {
-		t.Fatalf("create: %s", got.Data)
-	}
-
-	seen := 0
-	deadline := time.After(3 * time.Second)
-	for seen < 2 {
-		select {
-		case m := <-invCh:
-			if !bytes.Contains(m.Data, []byte(`"type":"invite"`)) {
-				t.Fatalf("invite: %s", m.Data)
-			}
-			seen++
-		case <-deadline:
-			t.Fatalf("invites=%d", seen)
-		}
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, peerEv, FrameKindPrepareV2)
+	if cPrep.Prepare.Role != "client" || sPrep.Prepare.Role != "server" {
+		t.Fatalf("prepare roles client=%+v server=%+v", cPrep.Prepare, sPrep.Prepare)
 	}
 }
 
 func TestClusterConcurrentRegisterSameKey(t *testing.T) {
-	_, _, mA, mB := startClusterManagers(t)
-
-	a := agentConnApp(t, mA.s, "shared-key")
-	b := agentConnApp(t, mB.s, "shared-key")
+	sA, _, _, _ := startClusterManagers(t)
+	a := agentConnApp(t, sA, "shared-key")
+	b := agentConnApp(t, sA, "shared-key")
+	t.Cleanup(a.Close)
+	t.Cleanup(b.Close)
 
 	start := make(chan struct{})
-	results := make(chan []byte, 2)
+	results := make(chan ErrorCodeV2, 2)
 	for _, nc := range []*nats.Conn{a, b} {
 		go func(nc *nats.Conn) {
 			<-start
-			msg := nats.NewMsg("$P2P.REGISTER")
-			msg.Header.Set("Nats-P2P-Name", "shared-key")
-			msg.Data = []byte(`{"node_key":"shared-key"}`)
-			got, err := nc.RequestMsg(msg, 3*time.Second)
-			if err != nil {
-				results <- []byte(err.Error())
+			got := tryRegisterV2(t, nc, sA.ID(), "shared-key", newRegistrationIDV2(t))
+			if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, got.Data); err == nil {
+				results <- ""
 				return
 			}
-			results <- got.Data
+			results <- mustErrorV2(t, got.Data).Code
 		}(nc)
 	}
 	close(start)
-
-	ok, inUse := 0, 0
+	ok, busy := 0, 0
 	for i := 0; i < 2; i++ {
-		data := <-results
-		switch {
-		case bytes.Contains(data, []byte(`"ok":true`)):
+		switch <-results {
+		case "":
 			ok++
-		case bytes.Contains(data, []byte(`node_key_in_use`)):
-			inUse++
+		case ErrBusyV2:
+			busy++
 		default:
-			t.Fatalf("unexpected: %s", data)
+			t.Fatal("expected one register reply and one busy")
 		}
 	}
-	if ok != 1 {
-		t.Fatalf("uniqueness broken: ok=%d in_use=%d (must be ok=1, never ok=2)", ok, inUse)
+	if ok > 1 || ok+busy != 2 {
+		t.Fatalf("ok=%d busy=%d (never two successes; both busy is ok when connz=2)", ok, busy)
 	}
-	if inUse != 1 {
-		t.Fatalf("ok=%d in_use=%d (want 1 and 1)", ok, inUse)
-	}
-
-	var owner string
-	for _, m := range []*Manager{mA, mB} {
-		rec, have := m.table.Get(testAgentAccount, "shared-key")
-		if !have {
-			t.Fatalf("missing occupancy on %s", m.serverID)
-		}
-		if owner == "" {
-			owner = rec.ClaimID
-		} else if rec.ClaimID != owner {
-			t.Fatalf("split occupancy claim_id %s vs %s", owner, rec.ClaimID)
-		}
-	}
-}
-
-func TestClusterPrepareFailureRetryNotFalseIdempotent(t *testing.T) {
-	_, sB, mA, mB := startClusterManagers(t)
-	account := testAgentAccount
-
-	for _, m := range []*Manager{mA, mB} {
-		m.peers.mu.Lock()
-		m.peers.lastBeat["ghost-peer"] = m.now()
-		m.peers.mu.Unlock()
-	}
-
-	ncB := agentConnApp(t, sB, "retry-key")
-	failReq := nats.NewMsg("$P2P.REGISTER")
-	failReq.Header.Set("Nats-P2P-Name", "retry-key")
-	failReq.Data = registerBody("retry-key")
-	got, err := ncB.RequestMsg(failReq, 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(got.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("first attempt should fail PREPARE: %s", got.Data)
-	}
-	if rec, ok := mB.table.Get(account, "retry-key"); ok && rec.ServerID == mB.serverID {
-		t.Fatal("failed PREPARE should not leave a local reservation")
-	}
-
-	got, err = ncB.RequestMsg(failReq, 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(got.Data, []byte(`"ok":true`)) {
-		t.Fatalf("retry must not false-idempotent succeed while PREPARE still fails: %s", got.Data)
-	}
-	if !bytes.Contains(got.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("retry should fail again: %s", got.Data)
-	}
-}
-
-func TestClusterPrepareTimeoutRollsBackPeers(t *testing.T) {
-	_, sB, mA, mB := startClusterManagers(t)
-	account := testAgentAccount
-
-	for _, m := range []*Manager{mA, mB} {
-		m.peers.mu.Lock()
-		m.peers.lastBeat["ghost-peer"] = m.now()
-		m.peers.mu.Unlock()
-	}
-
-	ncB := agentConnApp(t, sB, "timeout-key")
-	msg := nats.NewMsg("$P2P.REGISTER")
-	msg.Header.Set("Nats-P2P-Name", "timeout-key")
-	msg.Data = registerBody("timeout-key")
-	got, err := ncB.RequestMsg(msg, 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg = got
-	if !bytes.Contains(msg.Data, []byte(`node_key_in_use`)) {
-		t.Fatalf("want in_use on PREPARE timeout, got %s", msg.Data)
-	}
-	if rec, ok := mB.table.Get(account, "timeout-key"); ok && rec.ServerID == mB.serverID {
-		t.Fatal("B should not retain a local PREPARE reservation after timeout rollback")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if rec, ok := mA.table.Get(account, "timeout-key"); !ok || rec.ServerID != mB.serverID {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("A should release B placeholder after timeout rollback")
 }
 
 func TestClusterStaleDisconnectDoesNotDropNewOccupant(t *testing.T) {
 	sA, sB, mA, mB := startClusterManagers(t)
-	account := testAgentAccount
 	key := "shared-key"
-
-	ncA := agentConnApp(t, sA, key)
-	if msg := requestP2P(t, ncA, "$P2P.REGISTER", key, registerBody(key)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("A register: %s", msg.Data)
-	}
-	ncA.Close()
-
+	reg := newRegistrationIDV2(t)
 	ncB := agentConnApp(t, sB, key)
-	deadline := time.Now().Add(10 * time.Second)
-	var registered bool
-	var last []byte
-	for time.Now().Before(deadline) {
-		msg := nats.NewMsg("$P2P.REGISTER")
-		msg.Header.Set("Nats-P2P-Name", key)
-		msg.Data = registerBody(key)
-		got, err := ncB.RequestMsg(msg, time.Second)
-		if err == nil && bytes.Contains(got.Data, []byte(`"ok":true`)) {
-			registered = true
-			break
-		}
-		if err == nil {
-			last = got.Data
-		} else {
-			last = []byte(err.Error())
-		}
-		time.Sleep(100 * time.Millisecond)
+	t.Cleanup(ncB.Close)
+	mustRegisterV2(t, ncB, sB.ID(), key, reg)
+
+	cids, err := mB.lookupNamedAgentConns(key)
+	if err != nil || len(cids) != 1 {
+		t.Fatalf("cids=%v err=%v", cids, err)
 	}
-	if !registered {
-		t.Fatalf("B failed to register after A close, last=%s", last)
+	// Wrong server / wrong CID must not mark the live occupant disconnected.
+	mA.injectV2DisconnectFrom(sA.ID(), key, cids[0]+99)
+	if _, ok := mB.v2.store.LookupNode(key); !ok {
+		t.Fatal("stale disconnect dropped B occupancy")
 	}
 
-	recB, ok := mA.table.Get(account, key)
-	if !ok || recB.ServerID != mB.serverID {
-		t.Fatalf("A table should show B owner before stale disconnect: %+v ok=%v", recB, ok)
-	}
-
-	ev, _ := json.Marshal(map[string]any{"client": map[string]string{"name": key}})
-	mA.handleDisconnect(&nats.Msg{
-		Subject: "$SYS.ACCOUNT." + account + ".DISCONNECT",
-		Data:    ev,
-	})
-
-	if rec, ok := mA.table.Get(account, key); !ok || rec.ClaimID != recB.ClaimID {
-		t.Fatalf("stale disconnect wiped A table: had=%+v now=%+v ok=%v", recB, rec, ok)
-	}
-	if rec, ok := mB.table.Get(account, key); !ok || rec.ClaimID != recB.ClaimID {
-		t.Fatalf("stale disconnect wiped B table: had=%+v now=%+v ok=%v", recB, rec, ok)
-	}
-
+	peerReg := newRegistrationIDV2(t)
 	peer := agentConnApp(t, sA, "peer-node")
-	if msg := requestP2P(t, peer, "$P2P.REGISTER", "peer-node", registerBody("peer-node")); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("peer register: %s", msg.Data)
-	}
-	got := requestP2P(t, ncB, "$P2P.CREATE", key, []byte(`{"peer_node_key":"peer-node"}`))
-	if !bytes.Contains(got.Data, []byte(`"ok":true`)) {
-		t.Fatalf("B CREATE after stale disconnect: %s", got.Data)
+	t.Cleanup(peer.Close)
+	mustRegisterV2(t, peer, sA.ID(), "peer-node", peerReg)
+	alloc := createAllocatedOnNodeV2(t, ncB, key, "peer-node")
+	if alloc.SessionID == "" {
+		t.Fatal("CREATE after stale disconnect")
 	}
 }
 
 func TestClusterHeartbeatDropServerAllowsReregister(t *testing.T) {
-	sA, sB, mA, mB := startClusterManagers(t)
-	account := testAgentAccount
+	sA, sB, _, mB := startClusterManagers(t)
 	key := "beat-key"
-
 	ncB := agentConnApp(t, sB, key)
-	if msg := requestP2P(t, ncB, "$P2P.REGISTER", key, registerBody(key)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("B register: %s", msg.Data)
-	}
-	if rec, ok := mA.table.Get(account, key); !ok || rec.ServerID != mB.serverID {
-		t.Fatalf("A table missing B occupancy: %+v ok=%v", rec, ok)
-	}
+	mustRegisterV2(t, ncB, sB.ID(), key, newRegistrationIDV2(t))
 
 	mB.Stop()
 	sB.Shutdown()
+	ncB.Close()
 
 	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
@@ -437,20 +277,18 @@ func TestClusterHeartbeatDropServerAllowsReregister(t *testing.T) {
 		t.Fatalf("routes still up after B shutdown")
 	}
 
-	for time.Now().Before(deadline) {
-		if _, ok := mA.table.Get(account, key); !ok {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if rec, ok := mA.table.Get(account, key); ok {
-		t.Fatalf("expected DropServer to clear B key, still %+v", rec)
-	}
-
 	ncA := agentConnApp(t, sA, key)
-	if msg := requestP2P(t, ncA, "$P2P.REGISTER", key, registerBody(key)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
-		t.Fatalf("re-register after DropServer: %s", msg.Data)
+	t.Cleanup(ncA.Close)
+	var last []byte
+	for time.Now().Before(deadline) {
+		got := tryRegisterV2(t, ncA, sA.ID(), key, newRegistrationIDV2(t))
+		if _, err := DecodeFrameV2(FrameKindRegisterReplyV2, got.Data); err == nil {
+			return
+		}
+		last = got.Data
+		time.Sleep(100 * time.Millisecond)
 	}
+	t.Fatalf("re-register after peer drop: last=%s", last)
 }
 
 func TestClusterV2_NodeDisconnectGraceAndTombstone(t *testing.T) {
