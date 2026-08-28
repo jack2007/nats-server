@@ -101,6 +101,47 @@
       }
     },
     {
+      "name": "connection_open_omitted_id_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "OPEN",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        }
+      }
+    },
+    {
+      "name": "connection_open_empty_id_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "OPEN",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": ""
+        }
+      }
+    },
+    {
+      "name": "connection_open_proposed_id_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "OPEN",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-2"
+        }
+      }
+    },
+    {
       "name": "connection_restart_ok",
       "kind": "CONNECTION.COMMAND",
       "valid": true,
@@ -112,6 +153,20 @@
           "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
           "connection_id": "conn-0",
           "epoch": 1
+        }
+      }
+    },
+    {
+      "name": "connection_restart_omitted_epoch_ok",
+      "kind": "CONNECTION.COMMAND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "command": "RESTART",
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0"
         }
       }
     },
@@ -539,7 +594,7 @@
       }
     },
     {
-      "name": "signal_send_rejects_sender_node_key",
+      "name": "signal_send_command_rejects_sender_node_key",
       "kind": "SIGNAL.SEND",
       "valid": false,
       "error": "invalid_request",
@@ -554,6 +609,48 @@
           "seq": 3,
           "type": "candidate",
           "sender_node_key": "spoofed",
+          "payload": {
+            "candidate": "x"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_send_event_ok",
+      "kind": "SIGNAL.SEND",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 3,
+          "type": "candidate",
+          "sender_node_key": "client-a",
+          "payload": {
+            "candidate": "candidate:1 1 UDP 2130706431 192.0.2.1 3478 typ host"
+          }
+        }
+      }
+    },
+    {
+      "name": "signal_send_event_missing_sender_node_key",
+      "kind": "SIGNAL.SEND",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "message_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "registration_id": "0123456789abcdef0123456789abcdef",
+        "payload": {
+          "session_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "connection_id": "conn-0",
+          "epoch": 1,
+          "seq": 3,
+          "type": "candidate",
           "payload": {
             "candidate": "x"
           }

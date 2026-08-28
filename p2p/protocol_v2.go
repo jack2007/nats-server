@@ -106,8 +106,8 @@ type EnvelopeV2 struct {
 
 type IdentityV2 struct {
 	SessionID    string `json:"session_id"`
-	ConnectionID string `json:"connection_id"`
-	Epoch        uint64 `json:"epoch"`
+	ConnectionID string `json:"connection_id,omitempty"`
+	Epoch        uint64 `json:"epoch,omitempty"`
 }
 
 type TurnCredV2 struct {
@@ -165,9 +165,10 @@ type SignalSendCommandV2 struct {
 	RequestID string
 	MessageID string
 	IdentityV2
-	Seq     uint64
-	Type    SignalKindV2
-	Payload SignalPayloadV2
+	Seq           uint64
+	Type          SignalKindV2
+	Payload       SignalPayloadV2
+	SenderNodeKey string
 }
 
 type SignalAckCommandV2 struct {
@@ -530,7 +531,7 @@ func decodeConnectionCommandV2(env EnvelopeV2) (*ConnectionCommandV2, error) {
 	default:
 		return nil, invalidRequestV2()
 	}
-	if err := validateIdentityV2(payload.IdentityV2); err != nil {
+	if err := validateConnectionIdentityV2(payload.Command, payload.IdentityV2); err != nil {
 		return nil, err
 	}
 	return &ConnectionCommandV2{
@@ -542,17 +543,15 @@ func decodeConnectionCommandV2(env EnvelopeV2) (*ConnectionCommandV2, error) {
 }
 
 func decodeSignalSendV2(env EnvelopeV2) (*SignalSendCommandV2, error) {
-	if err := requireRequestIDV2(env.RequestID); err != nil {
-		return nil, err
-	}
 	if err := ValidateUUIDV2(env.MessageID); err != nil {
 		return nil, err
 	}
 	var payload struct {
 		IdentityV2
-		Seq     uint64          `json:"seq"`
-		Type    SignalKindV2    `json:"type"`
-		Payload SignalPayloadV2 `json:"payload"`
+		Seq           uint64          `json:"seq"`
+		Type          SignalKindV2    `json:"type"`
+		Payload       SignalPayloadV2 `json:"payload"`
+		SenderNodeKey string          `json:"sender_node_key,omitempty"`
 	}
 	if err := decodeStrictV2(env.Payload, &payload); err != nil {
 		return nil, err
@@ -566,13 +565,29 @@ func decodeSignalSendV2(env EnvelopeV2) (*SignalSendCommandV2, error) {
 	if err := validateSignalPayloadV2(payload.Type, payload.Payload); err != nil {
 		return nil, err
 	}
+	if env.RegistrationID != "" {
+		if err := ValidateRegistrationIDV2(env.RegistrationID); err != nil {
+			return nil, err
+		}
+		if err := ValidateNodeKeyV2(payload.SenderNodeKey); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := requireRequestIDV2(env.RequestID); err != nil {
+			return nil, err
+		}
+		if payload.SenderNodeKey != "" {
+			return nil, invalidRequestV2()
+		}
+	}
 	return &SignalSendCommandV2{
-		RequestID:  env.RequestID,
-		MessageID:  env.MessageID,
-		IdentityV2: payload.IdentityV2,
-		Seq:        payload.Seq,
-		Type:       payload.Type,
-		Payload:    payload.Payload,
+		RequestID:     env.RequestID,
+		MessageID:     env.MessageID,
+		IdentityV2:    payload.IdentityV2,
+		Seq:           payload.Seq,
+		Type:          payload.Type,
+		Payload:       payload.Payload,
+		SenderNodeKey: payload.SenderNodeKey,
 	}, nil
 }
 
@@ -756,6 +771,23 @@ func validateIdentityV2(id IdentityV2) error {
 		return invalidRequestV2()
 	}
 	return nil
+}
+
+func validateConnectionIdentityV2(kind ConnectionCommandKindV2, id IdentityV2) error {
+	if err := ValidateUUIDV2(id.SessionID); err != nil {
+		return err
+	}
+	switch kind {
+	case ConnectionCommandOpenV2:
+		if id.ConnectionID == "" {
+			return nil
+		}
+		return ValidateConnectionIDV2(id.ConnectionID)
+	case ConnectionCommandRestartV2:
+		return ValidateConnectionIDV2(id.ConnectionID)
+	default:
+		return validateIdentityV2(id)
+	}
 }
 
 func validateSignalPayloadV2(kind SignalKindV2, payload SignalPayloadV2) error {

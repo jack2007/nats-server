@@ -347,6 +347,132 @@ func TestV2Protocol_GoldenVectors(t *testing.T) {
 	}
 }
 
+func TestV2Protocol_ConnectionOpenIdentity(t *testing.T) {
+	type tc struct {
+		name    string
+		payload string
+		valid   bool
+	}
+	cases := []tc{
+		{
+			name:    "open_omitted_id_and_epoch",
+			payload: `{"command":"OPEN","session_id":"` + testSessionIDV2 + `"}`,
+			valid:   true,
+		},
+		{
+			name:    "open_empty_id_omitted_epoch",
+			payload: `{"command":"OPEN","session_id":"` + testSessionIDV2 + `","connection_id":""}`,
+			valid:   true,
+		},
+		{
+			name:    "open_proposed_id_omitted_epoch",
+			payload: `{"command":"OPEN","session_id":"` + testSessionIDV2 + `","connection_id":"conn-2"}`,
+			valid:   true,
+		},
+		{
+			name:    "open_proposed_id_epoch_zero",
+			payload: `{"command":"OPEN","session_id":"` + testSessionIDV2 + `","connection_id":"conn-2","epoch":0}`,
+			valid:   true,
+		},
+		{
+			name:    "open_invalid_id",
+			payload: `{"command":"OPEN","session_id":"` + testSessionIDV2 + `","connection_id":"conn-00"}`,
+			valid:   false,
+		},
+		{
+			name:    "restart_omitted_epoch",
+			payload: `{"command":"RESTART","session_id":"` + testSessionIDV2 + `","connection_id":"conn-0"}`,
+			valid:   true,
+		},
+		{
+			name:    "restart_epoch_zero",
+			payload: `{"command":"RESTART","session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":0}`,
+			valid:   true,
+		},
+		{
+			name:    "restart_missing_id",
+			payload: `{"command":"RESTART","session_id":"` + testSessionIDV2 + `"}`,
+			valid:   false,
+		},
+		{
+			name:    "ready_missing_id",
+			payload: `{"command":"READY","session_id":"` + testSessionIDV2 + `","epoch":1}`,
+			valid:   false,
+		},
+		{
+			name:    "ready_epoch_zero",
+			payload: `{"command":"READY","session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":0}`,
+			valid:   false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{"version":2,"request_id":"` + testRequestIDV2 + `","payload":` + c.payload + `}`
+			dec, err := DecodeFrameV2(FrameKindConnectionCommandV2, []byte(body))
+			if c.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if dec == nil || dec.Connection == nil {
+					t.Fatalf("decoded=%v", dec)
+				}
+				return
+			}
+			requireInvalidRequestV2(t, err)
+		})
+	}
+}
+
+func TestV2Protocol_SignalSenderNodeKey(t *testing.T) {
+	type tc struct {
+		name string
+		body string
+		want bool
+	}
+	cases := []tc{
+		{
+			name: "command_omits_sender",
+			body: `{"version":2,"request_id":"` + testRequestIDV2 + `","message_id":"` + testMessageIDV2 + `","payload":{"session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":1,"seq":1,"type":"end_of_candidates","payload":{}}}`,
+			want: true,
+		},
+		{
+			name: "command_rejects_sender",
+			body: `{"version":2,"request_id":"` + testRequestIDV2 + `","message_id":"` + testMessageIDV2 + `","payload":{"session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":1,"seq":1,"type":"end_of_candidates","sender_node_key":"spoofed","payload":{}}}`,
+			want: false,
+		},
+		{
+			name: "event_requires_sender",
+			body: `{"version":2,"message_id":"` + testMessageIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{"session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":1,"seq":3,"type":"candidate","sender_node_key":"client-a","payload":{"candidate":"x"}}}`,
+			want: true,
+		},
+		{
+			name: "event_missing_sender",
+			body: `{"version":2,"message_id":"` + testMessageIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{"session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":1,"seq":3,"type":"candidate","payload":{"candidate":"x"}}}`,
+			want: false,
+		},
+		{
+			name: "event_invalid_sender",
+			body: `{"version":2,"message_id":"` + testMessageIDV2 + `","registration_id":"` + testRegIDV2 + `","payload":{"session_id":"` + testSessionIDV2 + `","connection_id":"conn-0","epoch":1,"seq":3,"type":"candidate","sender_node_key":"bad.key","payload":{"candidate":"x"}}}`,
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dec, err := DecodeFrameV2(FrameKindSignalSendV2, []byte(c.body))
+			if c.want {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if dec == nil || dec.SignalSend == nil {
+					t.Fatalf("decoded=%v", dec)
+				}
+				return
+			}
+			requireInvalidRequestV2(t, err)
+		})
+	}
+}
+
 func TestV2Protocol_RequiredFieldsByKind(t *testing.T) {
 	type tc struct {
 		name string
