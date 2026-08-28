@@ -113,14 +113,15 @@ type sessionRecordV2 struct {
 }
 
 type requestRecordV2 struct {
-	node    NodeSnapshotV2
-	session SessionSnapshotV2
-	conn    ConnectionSnapshotV2
-	events  []EventV2
-	hasNode bool
-	hasSess bool
-	hasConn bool
-	hasEv   bool
+	node      NodeSnapshotV2
+	session   SessionSnapshotV2
+	conn      ConnectionSnapshotV2
+	events    []EventV2
+	sessionID string
+	hasNode   bool
+	hasSess   bool
+	hasConn   bool
+	hasEv     bool
 }
 
 func NewStoreV2(now func() time.Time, maxConnectionsPerSession int) *StoreV2 {
@@ -222,7 +223,7 @@ func (s *StoreV2) AllocateSession(sender string, cmd CreateSessionCommandV2) (Se
 	}
 	s.sessions[sid] = sess
 	snap := sessionSnapV2(sess)
-	s.requests[key] = requestRecordV2{session: snap, hasSess: true}
+	s.requests[key] = requestRecordV2{session: snap, sessionID: sid, hasSess: true}
 	return snap, nil
 }
 
@@ -266,14 +267,14 @@ func (s *StoreV2) BindSession(sender string, cmd SessionCommandV2) ([]EventV2, e
 		conn.state = ConnectionStatePreparingV2
 		events := s.makePrepareEvents(sess, conn)
 		conn.bindEvents = events
-		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), hasEv: true}
+		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 		return events, nil
 	case SessionCommandCloseV2:
 		events := s.closeSessionLocked(sess)
-		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), hasEv: true}
+		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 		return events, nil
 	case SessionCommandResumeV2:
-		s.requests[key] = requestRecordV2{hasEv: true}
+		s.requests[key] = requestRecordV2{sessionID: sess.id, hasEv: true}
 		return nil, nil
 	default:
 		return nil, invalidRequestV2()
@@ -301,9 +302,9 @@ func (s *StoreV2) MarkConnectionReady(sender string, cmd ConnectionCommandV2) ([
 		return nil, codeErrV2(ErrInvalidStateV2)
 	}
 	conn.ready[sender] = true
-	sess.revision++
 	var events []EventV2
 	if conn.ready[sess.client] && conn.ready[sess.server] {
+		sess.revision++
 		conn.state = ConnectionStateActiveV2
 		if sess.state == SessionStatePreparingV2 || sess.state == SessionStateAllocatedV2 {
 			sess.state = SessionStateActiveV2
@@ -311,7 +312,7 @@ func (s *StoreV2) MarkConnectionReady(sender string, cmd ConnectionCommandV2) ([
 		events = s.makeStartEvents(sess, conn)
 		conn.readyEvents = events
 	}
-	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), hasEv: true}
+	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 	return events, nil
 }
 
@@ -360,7 +361,7 @@ func (s *StoreV2) AllocateConnection(sender string, cmd ConnectionCommandV2) (Co
 	}
 	sess.connections[id] = conn
 	snap := connSnapV2(sess, conn)
-	s.requests[key] = requestRecordV2{conn: snap, hasConn: true}
+	s.requests[key] = requestRecordV2{conn: snap, sessionID: sess.id, hasConn: true}
 	return snap, nil
 }
 
@@ -407,7 +408,7 @@ func (s *StoreV2) AllocateRestart(sender string, cmd ConnectionCommandV2) (Conne
 	conn.readyEvents = nil
 	conn.setupDeadline = s.now().Add(DefaultSetupTimeoutV2)
 	snap := connSnapV2(sess, conn)
-	s.requests[key] = requestRecordV2{conn: snap, hasConn: true}
+	s.requests[key] = requestRecordV2{conn: snap, sessionID: sess.id, hasConn: true}
 	return snap, nil
 }
 
@@ -435,7 +436,7 @@ func (s *StoreV2) BindConnection(sender string, cmd ConnectionCommandV2) ([]Even
 	conn.state = ConnectionStatePreparingV2
 	events := s.makePrepareEvents(sess, conn)
 	conn.bindEvents = events
-	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), hasEv: true}
+	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 	return events, nil
 }
 
@@ -457,14 +458,14 @@ func (s *StoreV2) CloseConnection(sender string, cmd ConnectionCommandV2) ([]Eve
 		return nil, err
 	}
 	if conn.state == ConnectionStateClosedV2 {
-		s.requests[key] = requestRecordV2{events: cloneEventsV2(conn.closeEvents), hasEv: true}
+		s.requests[key] = requestRecordV2{events: cloneEventsV2(conn.closeEvents), sessionID: sess.id, hasEv: true}
 		return cloneEventsV2(conn.closeEvents), nil
 	}
 	sess.revision++
 	conn.state = ConnectionStateClosedV2
 	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
 	conn.closeEvents = events
-	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), hasEv: true}
+	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 	return events, nil
 }
 
@@ -477,6 +478,24 @@ func (s *StoreV2) Expire(now time.Time) []EventV2 {
 			if !now.Before(sess.setupDeadline) {
 				events = append(events, s.failSessionLocked(sess)...)
 			}
+			continue
+		}
+		if sess.state != SessionStateActiveV2 {
+			continue
+		}
+		var expired []string
+		for id, conn := range sess.connections {
+			if conn.state != ConnectionStateAllocatedV2 && conn.state != ConnectionStatePreparingV2 {
+				continue
+			}
+			if now.Before(conn.setupDeadline) {
+				continue
+			}
+			events = append(events, s.failConnectionLocked(sess, conn)...)
+			expired = append(expired, id)
+		}
+		for _, id := range expired {
+			delete(sess.connections, id)
 		}
 	}
 	for key, n := range s.nodes {
@@ -525,6 +544,9 @@ func (s *StoreV2) requireNode(key string) (*nodeRecordV2, error) {
 func (s *StoreV2) requireSession(id string) (*sessionRecordV2, error) {
 	if sess, ok := s.sessions[id]; ok {
 		return sess, nil
+	}
+	if _, ok := s.tombs[id]; ok {
+		return nil, codeErrV2(ErrSessionNotFoundV2)
 	}
 	return nil, codeErrV2(ErrSessionNotFoundV2)
 }
@@ -593,16 +615,51 @@ func (s *StoreV2) failSessionLocked(sess *sessionRecordV2) []EventV2 {
 	return events
 }
 
+func (s *StoreV2) failConnectionLocked(sess *sessionRecordV2, conn *connectionRecordV2) []EventV2 {
+	sess.revision++
+	conn.state = ConnectionStateClosedV2
+	return s.notifyBoth(sess, conn, FrameKindErrorV2)
+}
+
 func (s *StoreV2) buryLocked(sess *sessionRecordV2) {
 	sess.closedAt = s.now()
 	delete(s.sessions, sess.id)
 	s.tombs[sess.id] = sess
+	s.refreshSessionRequestSnapshots(sess)
+}
+
+func (s *StoreV2) refreshSessionRequestSnapshots(sess *sessionRecordV2) {
+	snap := sessionSnapV2(sess)
+	for key, rec := range s.requests {
+		if rec.sessionID != sess.id && !(rec.hasSess && rec.session.SessionID == sess.id) {
+			continue
+		}
+		rec.sessionID = sess.id
+		if rec.hasSess {
+			rec.session = snap
+		}
+		s.requests[key] = rec
+	}
 }
 
 func (s *StoreV2) dropSessionRequests(sessionID string) {
 	for key, rec := range s.requests {
-		if rec.hasSess && rec.session.SessionID == sessionID {
+		if rec.sessionID == sessionID || (rec.hasSess && rec.session.SessionID == sessionID) || (rec.hasConn && rec.conn.SessionID == sessionID) {
 			delete(s.requests, key)
+			continue
+		}
+		if rec.hasEv {
+			for _, ev := range rec.events {
+				if ev.Identity.SessionID == sessionID {
+					delete(s.requests, key)
+					break
+				}
+			}
+		}
+	}
+	for key := range s.messages {
+		if key.Direction.SessionID == sessionID {
+			delete(s.messages, key)
 		}
 	}
 }

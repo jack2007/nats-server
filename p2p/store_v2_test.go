@@ -127,6 +127,17 @@ func connCmdV2(t *testing.T, kind ConnectionCommandKindV2, sessionID, connID str
 	}
 }
 
+func sessionRevisionV2(t *testing.T, s *StoreV2, sessionID string) uint64 {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		t.Fatalf("session %s not live", sessionID)
+	}
+	return sess.revision
+}
+
 func eventTargetsV2(events []EventV2) map[string][]FrameKindV2 {
 	out := make(map[string][]FrameKindV2)
 	for _, ev := range events {
@@ -217,12 +228,20 @@ func TestStoreV2_BothReadyEmitsStart(t *testing.T) {
 	if len(first) != 0 {
 		t.Fatalf("single ready published %+v", first)
 	}
+	// First READY is a no-publish mark: revision stays at the BIND/PREPARE value so the
+	// peer can READY with the same revision. Revision increments only when START is emitted.
+	if got := sessionRevisionV2(t, s, snap.SessionID); got != rev {
+		t.Fatalf("first READY bumped revision to %d, want unchanged %d", got, rev)
+	}
 
 	second, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, rev))
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireBothKindsV2(t, second, FrameKindStartV2)
+	if second[0].Revision <= rev {
+		t.Fatalf("START revision %d must increase past BIND revision %d", second[0].Revision, rev)
+	}
 }
 
 func TestStoreV2_StateCommandsIdempotentByRequestID(t *testing.T) {
@@ -636,5 +655,140 @@ func TestStoreV2_ConcurrentSessions(t *testing.T) {
 	close(errc)
 	for err := range errc {
 		t.Fatal(err)
+	}
+}
+
+func TestStoreV2_ExpireActiveSessionConnectionSetupDeadline(t *testing.T) {
+	s, clock := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	sess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	bindEv, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, sess))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := bindEv[0].Revision
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sess.SessionID, "conn-0", 1, rev)); err != nil {
+		t.Fatal(err)
+	}
+	startEv, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sess.SessionID, "conn-0", 1, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev = startEv[0].Revision
+
+	open, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-1", 0, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(DefaultSetupTimeoutV2 + time.Millisecond)
+	expired := s.Expire(clock.Now())
+	if len(expired) == 0 {
+		t.Fatal("OPEN generation past setup deadline should emit fail events")
+	}
+	for _, ev := range expired {
+		if ev.Kind != FrameKindErrorV2 {
+			t.Fatalf("expire event %+v, want ERROR", ev)
+		}
+		if ev.Identity.ConnectionID != "conn-1" {
+			t.Fatalf("expire must fail the OPEN generation, not the session: %+v", ev.Identity)
+		}
+	}
+	if _, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-1", open.Epoch, open.Revision)); err == nil {
+		t.Fatal("expired OPEN generation should not bind")
+	} else {
+		requireCodeV2(t, err, ErrConnectionNotFoundV2)
+	}
+
+	again, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-2", 0, sessionRevisionV2(t, s, sess.SessionID)))
+	if err != nil {
+		t.Fatalf("ACTIVE session should accept a new OPEN after generation setup_timeout: %v", err)
+	}
+	if again.ConnectionID != "conn-2" || again.State != ConnectionStateAllocatedV2 {
+		t.Fatalf("new OPEN snapshot %+v", again)
+	}
+}
+
+func TestStoreV2_TombstoneRequestLifecycle(t *testing.T) {
+	s, clock := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+
+	create := CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}
+	snap, err := s.AllocateSession(storeClientNodeV2, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := sessionBindCmdV2(t, snap)
+	if _, err := s.BindSession(storeClientNodeV2, bind); err != nil {
+		t.Fatal(err)
+	}
+	closeReq := SessionCommandV2{
+		RequestID: mustUUIDV2(t),
+		Command:   SessionCommandCloseV2,
+		IdentityV2: IdentityV2{
+			SessionID:    snap.SessionID,
+			ConnectionID: "conn-0",
+			Epoch:        1,
+		},
+	}
+	if _, err := s.BindSession(storeClientNodeV2, closeReq); err != nil {
+		t.Fatal(err)
+	}
+
+	replay, err := s.AllocateSession(storeClientNodeV2, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.SessionID != snap.SessionID {
+		t.Fatalf("CREATE during tombstone recreated session %s, want %s", replay.SessionID, snap.SessionID)
+	}
+	if replay.State != SessionStateClosedV2 {
+		t.Fatalf("CREATE during tombstone state %s, want closed", replay.State)
+	}
+
+	lateBind := sessionBindCmdV2(t, snap)
+	if _, err := s.BindSession(storeClientNodeV2, lateBind); err == nil {
+		t.Fatal("late BIND during tombstone must not recreate")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, snap.Revision)); err == nil {
+		t.Fatal("late READY during tombstone must not recreate")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+	if _, err := s.BindSession(storeClientNodeV2, bind); err != nil {
+		t.Fatal(err)
+	}
+
+	msgKey := MessageKeyV2{
+		Direction: DirectionKeyV2{GenerationKeyV2: GenerationKeyV2{snap.SessionID, "conn-0", 1}, SenderNodeKey: storeClientNodeV2},
+		MessageID: "11111111-1111-4111-8111-111111111111",
+	}
+	if !s.RememberMessage(msgKey) {
+		t.Fatal("first message store")
+	}
+
+	clock.Advance(DefaultTombstoneTTLV2 + time.Millisecond)
+	_ = s.Expire(clock.Now())
+
+	after, err := s.AllocateSession(storeClientNodeV2, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SessionID == snap.SessionID {
+		t.Fatal("CREATE request_id still bound to dead session after tombstone TTL")
+	}
+	if after.State != SessionStateAllocatedV2 {
+		t.Fatalf("new CREATE after TTL state %s", after.State)
+	}
+	if _, err := s.BindSession(storeClientNodeV2, bind); err == nil {
+		t.Fatal("BIND request tombstone should be collected after TTL")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+	if !s.RememberMessage(msgKey) {
+		t.Fatal("message key should be recycled after tombstone TTL")
 	}
 }
