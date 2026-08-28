@@ -1,0 +1,640 @@
+package p2p
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+)
+
+const (
+	storeClientNodeV2 = "client-a"
+	storeServerNodeV2 = "server-b"
+	storeOtherNodeV2  = "other-c"
+	storeClientRegV2  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	storeServerRegV2  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	storeOtherRegV2   = "cccccccccccccccccccccccccccccccc"
+	storeMaxConnsV2   = 128
+)
+
+type storeClockV2 struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newStoreClockV2() *storeClockV2 {
+	return &storeClockV2{t: time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)}
+}
+
+func (c *storeClockV2) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *storeClockV2) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+func newTestStoreV2(t *testing.T) (*StoreV2, *storeClockV2) {
+	t.Helper()
+	clock := newStoreClockV2()
+	return NewStoreV2(clock.Now, storeMaxConnsV2), clock
+}
+
+func mustUUIDV2(t *testing.T) string {
+	t.Helper()
+	id, err := NewUUIDV2()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func requireCodeV2(t *testing.T, err error, code ErrorCodeV2) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected %s", code)
+	}
+	var perr *ProtocolErrorV2
+	if !errors.As(err, &perr) || perr.Code != code {
+		t.Fatalf("got %v, want %s", err, code)
+	}
+}
+
+func mustRegisterNodeV2(t *testing.T, s *StoreV2, node, reg string) NodeSnapshotV2 {
+	t.Helper()
+	snap, err := s.RegisterNode(RegisterCommandV2{
+		NodeKey:        node,
+		RequestID:      mustUUIDV2(t),
+		RegistrationID: reg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.NodeKey != node || snap.RegistrationID != reg || snap.RegistrationEpoch == 0 {
+		t.Fatalf("register snapshot %+v", snap)
+	}
+	return snap
+}
+
+func mustAllocateSessionV2(t *testing.T, s *StoreV2, sender string) SessionSnapshotV2 {
+	t.Helper()
+	snap, err := s.AllocateSession(sender, CreateSessionCommandV2{
+		RequestID:     mustUUIDV2(t),
+		ServerNodeKey: storeServerNodeV2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.SessionID == "" || snap.ConnectionID != "conn-0" || snap.Epoch != 1 {
+		t.Fatalf("allocate snapshot %+v", snap)
+	}
+	if snap.State != SessionStateAllocatedV2 || snap.Revision != 1 {
+		t.Fatalf("allocate state %+v", snap)
+	}
+	return snap
+}
+
+func sessionBindCmdV2(t *testing.T, snap SessionSnapshotV2) SessionCommandV2 {
+	t.Helper()
+	return SessionCommandV2{
+		RequestID: mustUUIDV2(t),
+		Command:   SessionCommandBindV2,
+		IdentityV2: IdentityV2{
+			SessionID:    snap.SessionID,
+			ConnectionID: snap.ConnectionID,
+			Epoch:        snap.Epoch,
+		},
+		Revision: snap.Revision,
+	}
+}
+
+func connCmdV2(t *testing.T, kind ConnectionCommandKindV2, sessionID, connID string, epoch, revision uint64) ConnectionCommandV2 {
+	t.Helper()
+	return ConnectionCommandV2{
+		RequestID: mustUUIDV2(t),
+		Command:   kind,
+		IdentityV2: IdentityV2{
+			SessionID:    sessionID,
+			ConnectionID: connID,
+			Epoch:        epoch,
+		},
+		Revision: revision,
+	}
+}
+
+func eventTargetsV2(events []EventV2) map[string][]FrameKindV2 {
+	out := make(map[string][]FrameKindV2)
+	for _, ev := range events {
+		out[ev.TargetNodeKey] = append(out[ev.TargetNodeKey], ev.Kind)
+	}
+	return out
+}
+
+func requireBothKindsV2(t *testing.T, events []EventV2, kind FrameKindV2) {
+	t.Helper()
+	targets := eventTargetsV2(events)
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2: %+v", len(events), events)
+	}
+	if len(targets[storeClientNodeV2]) != 1 || targets[storeClientNodeV2][0] != kind {
+		t.Fatalf("client events %v, want %s", targets[storeClientNodeV2], kind)
+	}
+	if len(targets[storeServerNodeV2]) != 1 || targets[storeServerNodeV2][0] != kind {
+		t.Fatalf("server events %v, want %s", targets[storeServerNodeV2], kind)
+	}
+	for _, ev := range events {
+		if ev.MessageID == "" || ev.RegistrationID == "" {
+			t.Fatalf("event missing ids %+v", ev)
+		}
+		if ev.Identity.ConnectionID == "" || ev.Identity.Epoch == 0 {
+			t.Fatalf("event missing identity %+v", ev)
+		}
+	}
+}
+
+func TestStoreV2_CreateOnlyAllocates(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+
+	snap := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	if snap.ClientNodeKey != storeClientNodeV2 || snap.ServerNodeKey != storeServerNodeV2 {
+		t.Fatalf("members %+v", snap)
+	}
+}
+
+func TestStoreV2_SessionBindEmitsConn0Prepare(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	snap := mustAllocateSessionV2(t, s, storeClientNodeV2)
+
+	events, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, snap))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBothKindsV2(t, events, FrameKindPrepareV2)
+	for _, ev := range events {
+		if ev.Identity.ConnectionID != "conn-0" || ev.Identity.Epoch != 1 {
+			t.Fatalf("prepare identity %+v", ev.Identity)
+		}
+		if ev.Prepare == nil || ev.Prepare.Role == "" || ev.Prepare.PeerNodeKey == "" {
+			t.Fatalf("prepare payload %+v", ev)
+		}
+		if ev.Prepare.SetupDeadlineMs <= 0 {
+			t.Fatalf("setup deadline %d", ev.Prepare.SetupDeadlineMs)
+		}
+	}
+	roles := map[string]string{}
+	for _, ev := range events {
+		roles[ev.TargetNodeKey] = ev.Prepare.Role
+	}
+	if roles[storeClientNodeV2] != "client" || roles[storeServerNodeV2] != "server" {
+		t.Fatalf("roles %v", roles)
+	}
+}
+
+func TestStoreV2_BothReadyEmitsStart(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	snap := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	events, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, snap))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := events[0].Revision
+
+	first, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 0 {
+		t.Fatalf("single ready published %+v", first)
+	}
+
+	second, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBothKindsV2(t, second, FrameKindStartV2)
+}
+
+func TestStoreV2_StateCommandsIdempotentByRequestID(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+
+	create := CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}
+	first, err := s.AllocateSession(storeClientNodeV2, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.AllocateSession(storeClientNodeV2, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first {
+		t.Fatalf("create idempotency %+v vs %+v", first, again)
+	}
+
+	bind := sessionBindCmdV2(t, first)
+	ev1, err := s.BindSession(storeClientNodeV2, bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev2, err := s.BindSession(storeClientNodeV2, bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ev2) != len(ev1) || ev2[0].MessageID != ev1[0].MessageID {
+		t.Fatalf("bind replay events %+v vs %+v", ev1, ev2)
+	}
+
+	ready := connCmdV2(t, ConnectionCommandReadyV2, first.SessionID, "conn-0", 1, ev1[0].Revision)
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, ready); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := s.MarkConnectionReady(storeClientNodeV2, ready)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 0 {
+		t.Fatalf("ready replay published %+v", replay)
+	}
+}
+
+func TestStoreV2_OpenRestartTwoPhase(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	sess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	bindEv, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, sess))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := bindEv[0].Revision
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sess.SessionID, "conn-0", 1, rev)); err != nil {
+		t.Fatal(err)
+	}
+	startEv, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sess.SessionID, "conn-0", 1, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev = startEv[0].Revision
+
+	open, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "", 0, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.ConnectionID != "conn-1" || open.Epoch != 1 || open.State != ConnectionStateAllocatedV2 {
+		t.Fatalf("open snapshot %+v", open)
+	}
+
+	restart, err := s.AllocateRestart(storeClientNodeV2, connCmdV2(t, ConnectionCommandRestartV2, sess.SessionID, "conn-0", 1, open.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restart.ConnectionID != "conn-0" || restart.Epoch != 2 {
+		t.Fatalf("restart snapshot %+v", restart)
+	}
+	if restart.State != ConnectionStateAllocatedV2 {
+		t.Fatalf("restart must stay allocated before bind %+v", restart)
+	}
+
+	bindOpen, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, open.ConnectionID, open.Epoch, restart.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBothKindsV2(t, bindOpen, FrameKindPrepareV2)
+	for _, ev := range bindOpen {
+		if ev.Identity.ConnectionID != "conn-1" || ev.Identity.Epoch != 1 {
+			t.Fatalf("open prepare %+v", ev.Identity)
+		}
+	}
+
+	bindRestart, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-0", 2, bindOpen[0].Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireBothKindsV2(t, bindRestart, FrameKindPrepareV2)
+	for _, ev := range bindRestart {
+		if ev.Identity.Epoch != 2 {
+			t.Fatalf("restart prepare epoch %+v", ev.Identity)
+		}
+	}
+}
+
+func TestStoreV2_Isolation(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	mustRegisterNodeV2(t, s, storeOtherNodeV2, storeOtherRegV2)
+
+	sharedReq := mustUUIDV2(t)
+	sessA, err := s.AllocateSession(storeClientNodeV2, CreateSessionCommandV2{RequestID: sharedReq, ServerNodeKey: storeServerNodeV2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessB, err := s.AllocateSession(storeOtherNodeV2, CreateSessionCommandV2{RequestID: sharedReq, ServerNodeKey: storeServerNodeV2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessA.SessionID == sessB.SessionID {
+		t.Fatal("shared request id across nodes collided")
+	}
+	if sessA.ConnectionID != "conn-0" || sessB.ConnectionID != "conn-0" {
+		t.Fatalf("both sessions should own conn-0: %+v %+v", sessA, sessB)
+	}
+
+	msg := "11111111-1111-4111-8111-111111111111"
+	first := s.RememberMessage(MessageKeyV2{
+		Direction: DirectionKeyV2{GenerationKeyV2: GenerationKeyV2{sessA.SessionID, "conn-0", 1}, SenderNodeKey: storeClientNodeV2},
+		MessageID: msg,
+	})
+	otherDir := s.RememberMessage(MessageKeyV2{
+		Direction: DirectionKeyV2{GenerationKeyV2: GenerationKeyV2{sessA.SessionID, "conn-0", 1}, SenderNodeKey: storeServerNodeV2},
+		MessageID: msg,
+	})
+	if !first || !otherDir {
+		t.Fatal("same message id on different DirectionKey must not dedup")
+	}
+	dup := s.RememberMessage(MessageKeyV2{
+		Direction: DirectionKeyV2{GenerationKeyV2: GenerationKeyV2{sessA.SessionID, "conn-0", 1}, SenderNodeKey: storeClientNodeV2},
+		MessageID: msg,
+	})
+	if dup {
+		t.Fatal("same DirectionKey + message id should dedup")
+	}
+
+	bind := sessionBindCmdV2(t, sessA)
+	if _, err := s.BindSession(storeOtherNodeV2, bind); err == nil {
+		t.Fatal("expected not_session_member")
+	} else {
+		requireCodeV2(t, err, ErrNotSessionMemberV2)
+	}
+
+	if _, err := s.BindSession(storeClientNodeV2, SessionCommandV2{
+		RequestID: mustUUIDV2(t),
+		Command:   SessionCommandBindV2,
+		IdentityV2: IdentityV2{
+			SessionID:    mustUUIDV2(t),
+			ConnectionID: "conn-0",
+			Epoch:        1,
+		},
+	}); err == nil {
+		t.Fatal("expected session_not_found")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+
+	ev, err := s.BindSession(storeClientNodeV2, bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sessA.SessionID, "conn-0", 1, ev[0].Revision)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sessA.SessionID, "conn-0", 99, ev[0].Revision)); err == nil {
+		t.Fatal("expected future_epoch")
+	} else {
+		requireCodeV2(t, err, ErrFutureEpochV2)
+	}
+
+	readyEv, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sessA.SessionID, "conn-0", 1, ev[0].Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restart, err := s.AllocateRestart(storeClientNodeV2, connCmdV2(t, ConnectionCommandRestartV2, sessA.SessionID, "conn-0", 1, readyEv[0].Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sessA.SessionID, "conn-0", 1, restart.Revision)); err == nil {
+		t.Fatal("expected stale_epoch")
+	} else {
+		requireCodeV2(t, err, ErrStaleEpochV2)
+	}
+
+	if _, err := s.MarkConnectionReady(storeOtherNodeV2, connCmdV2(t, ConnectionCommandReadyV2, sessB.SessionID, "conn-0", 1, 1)); err == nil {
+		t.Fatal("expected invalid_state before bind")
+	} else {
+		requireCodeV2(t, err, ErrInvalidStateV2)
+	}
+}
+
+func TestStoreV2_ConnectionLimit(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	mustRegisterNodeV2(t, s, storeOtherNodeV2, storeOtherRegV2)
+
+	sess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	rev := sess.Revision
+	var last ConnectionSnapshotV2
+	for i := 1; i < storeMaxConnsV2; i++ {
+		open, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, fmt.Sprintf("conn-%d", i), 0, rev))
+		if err != nil {
+			t.Fatalf("open %d: %v", i, err)
+		}
+		last = open
+		rev = open.Revision
+	}
+	if last.ConnectionID != "conn-127" {
+		t.Fatalf("128th connection id %s", last.ConnectionID)
+	}
+
+	if _, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-128", 0, rev)); err == nil {
+		t.Fatal("expected connection_limit")
+	} else {
+		requireCodeV2(t, err, ErrConnectionLimitV2)
+	}
+
+	other, err := s.AllocateSession(storeOtherNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.AllocateConnection(storeOtherNodeV2, connCmdV2(t, ConnectionCommandOpenV2, other.SessionID, "", 0, other.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ConnectionID != "conn-1" {
+		t.Fatalf("other session first extra connection %+v", first)
+	}
+
+	restart, err := s.AllocateRestart(storeClientNodeV2, connCmdV2(t, ConnectionCommandRestartV2, sess.SessionID, "conn-0", 1, rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restart.Epoch != 2 {
+		t.Fatalf("restart epoch %+v", restart)
+	}
+	if _, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-200", 0, restart.Revision)); err == nil {
+		t.Fatal("restart must not free a slot")
+	} else {
+		requireCodeV2(t, err, ErrConnectionLimitV2)
+	}
+}
+
+func TestStoreV2_Expire(t *testing.T) {
+	s, clock := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+
+	setupSess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	clock.Advance(DefaultSetupTimeoutV2 + time.Millisecond)
+	expired := s.Expire(clock.Now())
+	if len(expired) == 0 {
+		t.Fatal("setup deadline should emit expire events")
+	}
+	if _, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, setupSess)); err == nil {
+		t.Fatal("expired allocated session should not bind")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+
+	active := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	bindEv, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, active))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := bindEv[0].Revision
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, active.SessionID, "conn-0", 1, rev)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, active.SessionID, "conn-0", 1, rev)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(24 * time.Hour)
+	if ev := s.Expire(clock.Now()); len(ev) != 0 {
+		t.Fatalf("active session has no idle timeout: %+v", ev)
+	}
+	if _, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, active.SessionID, "conn-1", 0, 0)); err != nil {
+		t.Fatalf("active session should survive idle expire: %v", err)
+	}
+
+	s.MarkNodeDisconnected(storeOtherNodeV2)
+	mustRegisterNodeV2(t, s, storeOtherNodeV2, storeOtherRegV2)
+	s.MarkNodeDisconnected(storeOtherNodeV2)
+	clock.Advance(NodeDisconnectGraceV2 - time.Second)
+	_ = s.Expire(clock.Now())
+	if _, err := s.AllocateSession(storeOtherNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err != nil {
+		t.Fatalf("grace not elapsed: %v", err)
+	}
+	s.MarkNodeDisconnected(storeOtherNodeV2)
+	clock.Advance(NodeDisconnectGraceV2 + time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.AllocateSession(storeOtherNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err == nil {
+		t.Fatal("expected not_registered after disconnect grace")
+	} else {
+		requireCodeV2(t, err, ErrNotRegisteredV2)
+	}
+
+	closeSess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	closeReq := SessionCommandV2{
+		RequestID: mustUUIDV2(t),
+		Command:   SessionCommandCloseV2,
+		IdentityV2: IdentityV2{
+			SessionID:    closeSess.SessionID,
+			ConnectionID: "conn-0",
+			Epoch:        1,
+		},
+	}
+	if _, err := s.BindSession(storeClientNodeV2, closeReq); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := s.BindSession(storeClientNodeV2, closeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay != nil && len(replay) == 0 {
+		// idempotent close may return stored events or empty current state
+	}
+	clock.Advance(DefaultTombstoneTTLV2 + time.Millisecond)
+	_ = s.Expire(clock.Now())
+	if _, err := s.BindSession(storeClientNodeV2, sessionBindCmdV2(t, closeSess)); err == nil {
+		t.Fatal("tombstone should be gone")
+	} else {
+		requireCodeV2(t, err, ErrSessionNotFoundV2)
+	}
+}
+
+func TestStoreV2_UnregisteredAndPeerErrors(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	if _, err := s.AllocateSession(storeClientNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err == nil {
+		t.Fatal("expected not_registered")
+	} else {
+		requireCodeV2(t, err, ErrNotRegisteredV2)
+	}
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	if _, err := s.AllocateSession(storeClientNodeV2, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2}); err == nil {
+		t.Fatal("expected peer_not_registered")
+	} else {
+		requireCodeV2(t, err, ErrPeerNotRegisteredV2)
+	}
+}
+
+func TestStoreV2_CloseConnection(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	sess := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	open, err := s.AllocateConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandOpenV2, sess.SessionID, "conn-1", 0, sess.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeEv, err := s.CloseConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandCloseV2, sess.SessionID, "conn-1", open.Epoch, open.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closeEv) == 0 {
+		t.Fatal("close should notify both peers")
+	}
+	if _, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, sess.SessionID, "conn-1", open.Epoch, open.Revision)); err == nil {
+		t.Fatal("closed connection should not bind")
+	} else {
+		requireCodeV2(t, err, ErrInvalidStateV2)
+	}
+}
+
+func TestStoreV2_ConcurrentSessions(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	mustRegisterNodeV2(t, s, storeOtherNodeV2, storeOtherRegV2)
+
+	var wg sync.WaitGroup
+	errc := make(chan error, 2)
+	run := func(sender string) {
+		defer wg.Done()
+		snap, err := s.AllocateSession(sender, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: storeServerNodeV2})
+		if err != nil {
+			errc <- err
+			return
+		}
+		ev, err := s.BindSession(sender, sessionBindCmdV2(t, snap))
+		if err != nil {
+			errc <- err
+			return
+		}
+		if _, err := s.MarkConnectionReady(sender, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, ev[0].Revision)); err != nil {
+			errc <- err
+			return
+		}
+		if _, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, "conn-0", 1, ev[0].Revision)); err != nil {
+			errc <- err
+		}
+	}
+	wg.Add(2)
+	go run(storeClientNodeV2)
+	go run(storeOtherNodeV2)
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		t.Fatal(err)
+	}
+}

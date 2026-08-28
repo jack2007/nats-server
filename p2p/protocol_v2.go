@@ -141,6 +141,7 @@ func invalidRequestV2() error {
 type RegisterCommandV2 struct {
 	RequestID      string
 	RegistrationID string
+	NodeKey        string
 }
 
 type RegisterReplyV2 struct {
