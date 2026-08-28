@@ -25,16 +25,26 @@ const (
 )
 
 var (
-	v2TestOnCommand func(string)
-	v2TestQueueSize int
-	v2TestWorkers   int
-	v2TestBlock     func()
+	v2TestOnCommand   func(string)
+	v2TestQueueSize   int
+	v2TestWorkers     int
+	v2TestBlock       func()
+	v2TestPublishHook func(subj string, data []byte) error
 )
 
 type v2NodeBinding struct {
 	registrationID string
 	epoch          uint64
 	cid            uint64
+}
+
+type signalRetryItemV2 struct {
+	dir       DirectionKeyV2
+	seq       uint64
+	messageID string
+	target    string
+	attempt   int
+	next      time.Time
 }
 
 type managerV2 struct {
@@ -46,6 +56,9 @@ type managerV2 struct {
 	mu        sync.Mutex
 	nodes     map[string]*v2NodeBinding
 	sessionMu sync.Map
+	retryMu   sync.Mutex
+	retries   map[MessageKeyV2]signalRetryItemV2
+	retryWake chan struct{}
 }
 
 func RetryAfterMsV2(attempt int) int64 {
@@ -90,10 +103,12 @@ func (m *Manager) startV2() error {
 		workers = v2TestWorkers
 	}
 	m.v2 = &managerV2{
-		store: NewStoreV2(m.now, v2MaxConnections),
-		cmdQ:  make(chan *nats.Msg, qsize),
-		stop:  make(chan struct{}),
-		nodes: make(map[string]*v2NodeBinding),
+		store:     NewStoreV2(m.now, v2MaxConnections),
+		cmdQ:      make(chan *nats.Msg, qsize),
+		stop:      make(chan struct{}),
+		nodes:     make(map[string]*v2NodeBinding),
+		retries:   make(map[MessageKeyV2]signalRetryItemV2),
+		retryWake: make(chan struct{}, 1),
 	}
 	regSubj := "$P2P.V2.CMD.*.REGISTER." + m.serverID
 	sub, err := m.nc.Subscribe(regSubj, m.handleV2Command)
@@ -118,6 +133,8 @@ func (m *Manager) startV2() error {
 		m.v2.wg.Add(1)
 		go m.v2Worker()
 	}
+	m.v2.wg.Add(1)
+	go m.signalRetryLoopV2()
 	return m.nc.Flush()
 }
 
@@ -193,8 +210,10 @@ func (m *Manager) dispatchV2(msg *nats.Msg) {
 		m.handleSessionV2(msg, sender)
 	case "CONNECTION.COMMAND":
 		m.handleConnectionV2(msg, sender)
-	case "SIGNAL.SEND", "SIGNAL.ACK":
-		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrInvalidStateV2, nil)
+	case "SIGNAL.SEND":
+		m.handleSignalSendV2(msg, sender)
+	case "SIGNAL.ACK":
+		m.handleSignalAckV2(msg, sender)
 	default:
 		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrInvalidRequestV2, nil)
 	}
@@ -378,6 +397,159 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 	}
 }
 
+func (m *Manager) handleSignalSendV2(msg *nats.Msg, sender string) {
+	dec, err := DecodeFrameV2(FrameKindSignalSendV2, msg.Data)
+	if err != nil {
+		m.replyV2Error(msg, requestIDFromData(msg.Data), protocolCodeV2(err), nil)
+		return
+	}
+	cmd := *dec.SignalSend
+	unlock := m.lockSessionV2(cmd.SessionID)
+	target, ev, err := m.v2.store.AcceptSignal(sender, cmd)
+	unlock()
+	if err != nil {
+		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+		return
+	}
+	m.replyV2Accepted(msg, cmd.RequestID)
+	if ev.MessageID == "" {
+		return
+	}
+	m.enqueueSignalRetryV2(signalRetryItemV2{
+		dir: DirectionKeyV2{
+			GenerationKeyV2: GenerationKeyV2{SessionID: ev.Identity.SessionID, ConnectionID: ev.Identity.ConnectionID, Epoch: ev.Identity.Epoch},
+			SenderNodeKey:   sender,
+		},
+		seq:       ev.Signal.Seq,
+		messageID: ev.MessageID,
+		target:    target,
+	})
+}
+
+func (m *Manager) handleSignalAckV2(msg *nats.Msg, sender string) {
+	dec, err := DecodeFrameV2(FrameKindSignalAckV2, msg.Data)
+	if err != nil {
+		m.replyV2Error(msg, requestIDFromData(msg.Data), protocolCodeV2(err), nil)
+		return
+	}
+	cmd := *dec.SignalAck
+	unlock := m.lockSessionV2(cmd.SessionID)
+	err = m.v2.store.AckSignal(sender, cmd)
+	unlock()
+	if err != nil {
+		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+		return
+	}
+	if snap, ok := m.v2.store.PeekSession(cmd.SessionID); ok {
+		peer := snap.ClientNodeKey
+		if sender == snap.ClientNodeKey {
+			peer = snap.ServerNodeKey
+		}
+		m.dropSignalRetriesV2(DirectionKeyV2{
+			GenerationKeyV2: GenerationKeyV2{SessionID: cmd.SessionID, ConnectionID: cmd.ConnectionID, Epoch: cmd.Epoch},
+			SenderNodeKey:   peer,
+		}, cmd.AckSeq)
+	}
+	m.replyV2OK(msg, cmd.RequestID)
+}
+
+func (m *Manager) replyV2Accepted(msg *nats.Msg, requestID string) {
+	body, err := encodeEnvelopeV2(requestID, "", "", map[string]any{"ok": true, "accepted": true})
+	if err != nil {
+		return
+	}
+	_ = msg.Respond(body)
+}
+
+func (m *Manager) enqueueSignalRetryV2(item signalRetryItemV2) {
+	if item.messageID == "" {
+		return
+	}
+	item.next = m.now()
+	key := MessageKeyV2{Direction: item.dir, MessageID: item.messageID}
+	m.v2.retryMu.Lock()
+	if _, ok := m.v2.retries[key]; !ok {
+		m.v2.retries[key] = item
+	}
+	m.v2.retryMu.Unlock()
+	m.wakeSignalRetryV2()
+}
+
+func (m *Manager) dropSignalRetriesV2(dir DirectionKeyV2, ackSeq uint64) {
+	m.v2.retryMu.Lock()
+	defer m.v2.retryMu.Unlock()
+	for k, item := range m.v2.retries {
+		if item.dir == dir && item.seq <= ackSeq {
+			delete(m.v2.retries, k)
+		}
+	}
+}
+
+func (m *Manager) wakeSignalRetryV2() {
+	select {
+	case m.v2.retryWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) signalRetryLoopV2() {
+	defer m.v2.wg.Done()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.v2.stop:
+			return
+		case <-m.v2.retryWake:
+			m.flushSignalRetriesV2()
+		case <-ticker.C:
+			m.flushSignalRetriesV2()
+		}
+	}
+}
+
+func (m *Manager) flushSignalRetriesV2() {
+	now := m.now()
+	var due []signalRetryItemV2
+	m.v2.retryMu.Lock()
+	for k, item := range m.v2.retries {
+		if item.next.After(now) {
+			continue
+		}
+		due = append(due, item)
+		delete(m.v2.retries, k)
+	}
+	m.v2.retryMu.Unlock()
+	for _, item := range due {
+		ev, ok := m.v2.store.pendingSignal(item.dir, item.seq)
+		if !ok {
+			continue
+		}
+		if ev.TargetNodeKey == "" {
+			ev.TargetNodeKey = item.target
+		}
+		if err := m.publishV2Event(item.target, ev); err != nil {
+			item.attempt++
+			item.next = now.Add(time.Duration(RetryAfterMsV2(item.attempt)) * time.Millisecond)
+			m.requeueSignalRetryV2(item)
+			continue
+		}
+		item.attempt++
+		item.next = now.Add(time.Duration(RetryAfterMsV2(item.attempt)) * time.Millisecond)
+		m.requeueSignalRetryV2(item)
+	}
+}
+
+func (m *Manager) requeueSignalRetryV2(item signalRetryItemV2) {
+	if _, ok := m.v2.store.pendingSignal(item.dir, item.seq); !ok {
+		return
+	}
+	key := MessageKeyV2{Direction: item.dir, MessageID: item.messageID}
+	m.v2.retryMu.Lock()
+	m.v2.retries[key] = item
+	m.v2.retryMu.Unlock()
+}
+
 func (m *Manager) publishEventsV2(events []EventV2) error {
 	var prepares []EventV2
 	var others []EventV2
@@ -421,14 +593,22 @@ func (m *Manager) publishPrepareV2(events []EventV2) error {
 }
 
 func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
-	reg := event.RegistrationID
-	m.v2.mu.Lock()
-	if b, ok := m.v2.nodes[nodeKey]; ok && b.registrationID != "" {
-		reg = b.registrationID
-	}
-	m.v2.mu.Unlock()
 	if event.TargetNodeKey != "" {
 		nodeKey = event.TargetNodeKey
+	}
+	reg := event.RegistrationID
+	if event.Kind == FrameKindSignalSendV2 {
+		snap, ok := m.v2.store.LookupNode(nodeKey)
+		if !ok || snap.RegistrationID == "" {
+			return errors.New("signal target registration missing")
+		}
+		reg = snap.RegistrationID
+	} else {
+		m.v2.mu.Lock()
+		if b, ok := m.v2.nodes[nodeKey]; ok && b.registrationID != "" {
+			reg = b.registrationID
+		}
+		m.v2.mu.Unlock()
 	}
 	subj, err := EventSubjectV2(nodeKey, reg)
 	if err != nil {
@@ -486,6 +666,21 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 			"sender_node_key": v2CoordinatorSender,
 		}
 		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
+	case FrameKindSignalSendV2:
+		sig := event.Signal
+		if sig == nil {
+			return errors.New("missing signal")
+		}
+		payload := map[string]any{
+			"session_id":      sig.SessionID,
+			"connection_id":   sig.ConnectionID,
+			"epoch":           sig.Epoch,
+			"seq":             sig.Seq,
+			"type":            sig.Type,
+			"payload":         sig.Payload,
+			"sender_node_key": sig.SenderNodeKey,
+		}
+		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
 	default:
 		payload := map[string]any{
 			"session_id":    event.Identity.SessionID,
@@ -497,6 +692,11 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 	}
 	if err != nil {
 		return err
+	}
+	if v2TestPublishHook != nil {
+		if err := v2TestPublishHook(subj, body); err != nil {
+			return err
+		}
 	}
 	return m.nc.Publish(subj, body)
 }

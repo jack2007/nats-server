@@ -69,17 +69,19 @@ type EventV2 struct {
 	PeerNodeKey    string
 	Prepare        *PrepareEventV2
 	Start          *StartEventV2
+	Signal         *SignalEventV2
 }
 
 type StoreV2 struct {
-	mu       sync.Mutex
-	now      func() time.Time
-	maxConns int
-	nodes    map[string]*nodeRecordV2
-	sessions map[string]*sessionRecordV2
-	tombs    map[string]*sessionRecordV2
-	requests map[RequestKeyV2]requestRecordV2
-	messages map[MessageKeyV2]struct{}
+	mu         sync.Mutex
+	now        func() time.Time
+	maxConns   int
+	nodes      map[string]*nodeRecordV2
+	sessions   map[string]*sessionRecordV2
+	tombs      map[string]*sessionRecordV2
+	requests   map[RequestKeyV2]requestRecordV2
+	messages   map[MessageKeyV2]struct{}
+	directions map[DirectionKeyV2]*directionRecordV2
 }
 
 type nodeRecordV2 struct {
@@ -133,13 +135,14 @@ func NewStoreV2(now func() time.Time, maxConnectionsPerSession int) *StoreV2 {
 		maxConnectionsPerSession = 128
 	}
 	return &StoreV2{
-		now:      now,
-		maxConns: maxConnectionsPerSession,
-		nodes:    make(map[string]*nodeRecordV2),
-		sessions: make(map[string]*sessionRecordV2),
-		tombs:    make(map[string]*sessionRecordV2),
-		requests: make(map[RequestKeyV2]requestRecordV2),
-		messages: make(map[MessageKeyV2]struct{}),
+		now:        now,
+		maxConns:   maxConnectionsPerSession,
+		nodes:      make(map[string]*nodeRecordV2),
+		sessions:   make(map[string]*sessionRecordV2),
+		tombs:      make(map[string]*sessionRecordV2),
+		requests:   make(map[RequestKeyV2]requestRecordV2),
+		messages:   make(map[MessageKeyV2]struct{}),
+		directions: make(map[DirectionKeyV2]*directionRecordV2),
 	}
 }
 
@@ -687,6 +690,11 @@ func (s *StoreV2) dropSessionRequests(sessionID string) {
 	for key := range s.messages {
 		if key.Direction.SessionID == sessionID {
 			delete(s.messages, key)
+		}
+	}
+	for key := range s.directions {
+		if key.SessionID == sessionID {
+			delete(s.directions, key)
 		}
 	}
 }
