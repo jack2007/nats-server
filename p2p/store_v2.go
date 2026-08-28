@@ -70,6 +70,7 @@ type EventV2 struct {
 	Prepare        *PrepareEventV2
 	Start          *StartEventV2
 	Signal         *SignalEventV2
+	Error          *ErrorPayloadV2
 }
 
 type StoreV2 struct {
@@ -420,6 +421,7 @@ func (s *StoreV2) AllocateRestart(sender string, cmd ConnectionCommandV2) (Conne
 			return ConnectionSnapshotV2{}, codeErrV2(ErrFutureEpochV2)
 		}
 	}
+	s.dropGenerationLocked(sess.id, conn.id, conn.epoch)
 	sess.revision++
 	conn.epoch++
 	conn.state = ConnectionStateAllocatedV2
@@ -486,10 +488,34 @@ func (s *StoreV2) CloseConnection(sender string, cmd ConnectionCommandV2) ([]Eve
 	}
 	sess.revision++
 	conn.state = ConnectionStateClosedV2
+	s.dropGenerationLocked(sess.id, conn.id, conn.epoch)
 	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
 	conn.closeEvents = events
 	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
 	return events, nil
+}
+
+func (s *StoreV2) ExpirePendingSignals(now time.Time) []EventV2 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var events []EventV2
+	for _, sess := range s.sessions {
+		if sess.state != SessionStateActiveV2 {
+			continue
+		}
+		for _, conn := range sess.connections {
+			if conn.state != ConnectionStateActiveV2 {
+				continue
+			}
+			if now.Before(conn.setupDeadline) {
+				continue
+			}
+			if s.generationHasPendingLocked(sess.id, conn.id, conn.epoch) {
+				events = append(events, s.failConnectionLocked(sess, conn)...)
+			}
+		}
+	}
+	return events
 }
 
 func (s *StoreV2) Expire(now time.Time) []EventV2 {
@@ -507,13 +533,19 @@ func (s *StoreV2) Expire(now time.Time) []EventV2 {
 			continue
 		}
 		for _, conn := range sess.connections {
-			if conn.state != ConnectionStateAllocatedV2 && conn.state != ConnectionStatePreparingV2 {
+			if conn.state == ConnectionStateClosedV2 {
 				continue
 			}
 			if now.Before(conn.setupDeadline) {
 				continue
 			}
-			events = append(events, s.failConnectionLocked(sess, conn)...)
+			if conn.state == ConnectionStateAllocatedV2 || conn.state == ConnectionStatePreparingV2 {
+				events = append(events, s.failConnectionLocked(sess, conn)...)
+				continue
+			}
+			if conn.state == ConnectionStateActiveV2 && s.generationHasPendingLocked(sess.id, conn.id, conn.epoch) {
+				events = append(events, s.failConnectionLocked(sess, conn)...)
+			}
 		}
 	}
 	for key, n := range s.nodes {
@@ -625,6 +657,7 @@ func (s *StoreV2) closeSessionLocked(sess *sessionRecordV2) []EventV2 {
 	for _, conn := range sess.connections {
 		conn.state = ConnectionStateClosedV2
 	}
+	s.dropSessionDirectionsLocked(sess.id)
 	conn := sess.connections["conn-0"]
 	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
 	sess.closeEvents = events
@@ -640,7 +673,11 @@ func (s *StoreV2) failSessionLocked(sess *sessionRecordV2) []EventV2 {
 	for _, conn := range sess.connections {
 		conn.state = ConnectionStateClosedV2
 	}
+	s.dropSessionDirectionsLocked(sess.id)
 	events := s.notifyBoth(sess, sess.connections["conn-0"], FrameKindErrorV2)
+	for i := range events {
+		events[i].Error = setupTimeoutErrorV2(sess.id, "conn-0")
+	}
 	s.buryLocked(sess)
 	return events
 }
@@ -648,7 +685,12 @@ func (s *StoreV2) failSessionLocked(sess *sessionRecordV2) []EventV2 {
 func (s *StoreV2) failConnectionLocked(sess *sessionRecordV2, conn *connectionRecordV2) []EventV2 {
 	sess.revision++
 	conn.state = ConnectionStateClosedV2
-	return s.notifyBoth(sess, conn, FrameKindErrorV2)
+	s.dropGenerationLocked(sess.id, conn.id, conn.epoch)
+	events := s.notifyBoth(sess, conn, FrameKindErrorV2)
+	for i := range events {
+		events[i].Error = setupTimeoutErrorV2(sess.id, conn.id)
+	}
+	return events
 }
 
 func (s *StoreV2) buryLocked(sess *sessionRecordV2) {
@@ -670,6 +712,59 @@ func (s *StoreV2) refreshSessionRequestSnapshots(sess *sessionRecordV2) {
 		}
 		s.requests[key] = rec
 	}
+}
+
+func setupTimeoutErrorV2(sessionID, connectionID string) *ErrorPayloadV2 {
+	return &ErrorPayloadV2{Code: ErrSetupTimeoutV2, SessionID: sessionID, ConnectionID: connectionID}
+}
+
+func (s *StoreV2) dropGenerationLocked(sessionID, connectionID string, epoch uint64) {
+	for key := range s.directions {
+		if key.SessionID == sessionID && key.ConnectionID == connectionID && key.Epoch == epoch {
+			delete(s.directions, key)
+		}
+	}
+	for key := range s.messages {
+		if key.Direction.SessionID == sessionID && key.Direction.ConnectionID == connectionID && key.Direction.Epoch == epoch {
+			delete(s.messages, key)
+		}
+	}
+}
+
+func (s *StoreV2) dropSessionDirectionsLocked(sessionID string) {
+	for key := range s.directions {
+		if key.SessionID == sessionID {
+			delete(s.directions, key)
+		}
+	}
+	for key := range s.messages {
+		if key.Direction.SessionID == sessionID {
+			delete(s.messages, key)
+		}
+	}
+}
+
+func (s *StoreV2) generationDeadline(dir DirectionKeyV2) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.sessions[dir.SessionID]
+	if sess == nil {
+		return time.Time{}, false
+	}
+	conn := sess.connections[dir.ConnectionID]
+	if conn == nil || conn.epoch != dir.Epoch || conn.state == ConnectionStateClosedV2 {
+		return time.Time{}, false
+	}
+	return conn.setupDeadline, true
+}
+
+func (s *StoreV2) generationHasPendingLocked(sessionID, connectionID string, epoch uint64) bool {
+	for key, d := range s.directions {
+		if key.SessionID == sessionID && key.ConnectionID == connectionID && key.Epoch == epoch && len(d.pending) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *StoreV2) dropSessionRequests(sessionID string) {

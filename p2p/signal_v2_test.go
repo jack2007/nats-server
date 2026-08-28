@@ -575,6 +575,337 @@ func TestManagerV2_SignalRetryDoesNotBlockStoreOrCallback(t *testing.T) {
 	}
 }
 
+func TestSignalV2_UnackedPastDeadlineFailsGeneration(t *testing.T) {
+	s, clock := newTestStoreV2(t)
+	snap := mustActiveSessionV2(t, s)
+	ident := signalIdentV2(snap)
+	dir := dirKeyV2(snap, storeClientNodeV2)
+	if _, _, err := s.AcceptSignal(storeClientNodeV2, signalSendCmdV2(t, ident, 1, SignalKindCandidateV2, SignalPayloadV2{Candidate: "x"})); err != nil {
+		t.Fatal(err)
+	}
+	if s.directionPending(dir) != 1 {
+		t.Fatal("expected unacked pending")
+	}
+
+	clock.Advance(DefaultSetupTimeoutV2 + time.Millisecond)
+	expired := s.Expire(clock.Now())
+	if len(expired) == 0 {
+		t.Fatal("unacked SIGNAL past setup deadline must fail the generation")
+	}
+	for _, ev := range expired {
+		if ev.Kind != FrameKindErrorV2 {
+			t.Fatalf("expire event %+v, want ERROR", ev)
+		}
+		if ev.Error == nil || ev.Error.Code != ErrSetupTimeoutV2 {
+			t.Fatalf("expire must be setup_timeout: %+v", ev.Error)
+		}
+		if ev.Identity.ConnectionID != snap.ConnectionID || ev.Identity.Epoch != snap.Epoch {
+			t.Fatalf("must fail this generation: %+v", ev.Identity)
+		}
+	}
+	if s.directionPending(dir) != 0 {
+		t.Fatalf("pending must be dropped after deadline pending=%d", s.directionPending(dir))
+	}
+	_, _, err := s.AcceptSignal(storeClientNodeV2, signalSendCmdV2(t, ident, 2, SignalKindEndOfCandidatesV2, SignalPayloadV2{}))
+	requireCodeV2(t, err, ErrInvalidStateV2)
+}
+
+func TestSignalV2_RestartAndCloseDropOldGenerationPending(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	snap := mustActiveSessionV2(t, s)
+	ident := signalIdentV2(snap)
+	dir := dirKeyV2(snap, storeClientNodeV2)
+	if _, _, err := s.AcceptSignal(storeClientNodeV2, signalSendCmdV2(t, ident, 1, SignalKindCandidateV2, SignalPayloadV2{Candidate: "old"})); err != nil {
+		t.Fatal(err)
+	}
+
+	restart, err := s.AllocateRestart(storeClientNodeV2, connCmdV2(t, ConnectionCommandRestartV2, snap.SessionID, snap.ConnectionID, snap.Epoch, snap.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.directionPending(dir) != 0 || s.hasDirection(dir) {
+		t.Fatalf("RESTART must drop old-generation pending has=%v pending=%d", s.hasDirection(dir), s.directionPending(dir))
+	}
+
+	bindEv, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, snap.SessionID, snap.ConnectionID, restart.Epoch, restart.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, snap.ConnectionID, restart.Epoch, bindEv[0].Revision)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, snap.SessionID, snap.ConnectionID, restart.Epoch, bindEv[0].Revision)); err != nil {
+		t.Fatal(err)
+	}
+	newIdent := IdentityV2{SessionID: snap.SessionID, ConnectionID: snap.ConnectionID, Epoch: restart.Epoch}
+	if _, _, err := s.AcceptSignal(storeClientNodeV2, signalSendCmdV2(t, newIdent, 1, SignalKindCandidateV2, SignalPayloadV2{Candidate: "new"})); err != nil {
+		t.Fatal(err)
+	}
+	newDir := DirectionKeyV2{GenerationKeyV2: GenerationKeyV2{SessionID: snap.SessionID, ConnectionID: snap.ConnectionID, Epoch: restart.Epoch}, SenderNodeKey: storeClientNodeV2}
+	if s.directionPending(newDir) != 1 {
+		t.Fatal("new epoch must keep its own pending")
+	}
+	if s.directionPending(dir) != 0 {
+		t.Fatal("old epoch pending must stay gone after BIND/READY")
+	}
+
+	closeSess := mustActiveSessionV2From(t, s, storeClientNodeV2, storeServerNodeV2)
+	closeIdent := signalIdentV2(closeSess)
+	closeDir := dirKeyV2(closeSess, storeClientNodeV2)
+	if _, _, err := s.AcceptSignal(storeClientNodeV2, signalSendCmdV2(t, closeIdent, 1, SignalKindEndOfCandidatesV2, SignalPayloadV2{})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindSession(storeClientNodeV2, SessionCommandV2{
+		RequestID:  mustUUIDV2(t),
+		Command:    SessionCommandCloseV2,
+		IdentityV2: closeIdent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s.directionPending(closeDir) != 0 || s.hasDirection(closeDir) {
+		t.Fatalf("SESSION.CLOSE must drop session pending immediately has=%v pending=%d", s.hasDirection(closeDir), s.directionPending(closeDir))
+	}
+
+	connSess := mustActiveSessionV2From(t, s, storeClientNodeV2, storeServerNodeV2)
+	connIdent := signalIdentV2(connSess)
+	connDir := dirKeyV2(connSess, storeClientNodeV2)
+	if _, _, err := s.AcceptSignal(storeClientNodeV2, signalSendCmdV2(t, connIdent, 1, SignalKindCandidateV2, SignalPayloadV2{Candidate: "c"})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandCloseV2, connSess.SessionID, connSess.ConnectionID, connSess.Epoch, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if s.directionPending(connDir) != 0 || s.hasDirection(connDir) {
+		t.Fatalf("CLOSE connection must drop generation pending has=%v pending=%d", s.hasDirection(connDir), s.directionPending(connDir))
+	}
+}
+
+func TestManagerV2_SignalRetryStopsAfterSetupDeadline(t *testing.T) {
+	s, m := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	const shortMs int64 = 400
+	ident, _ := mustCreateBindReadySessionTimeoutV2(t, client, srv, clientEv, serverEv, shortMs)
+
+	var pubs atomic.Int64
+	v2TestPublishHook = func(subj string, data []byte) error {
+		if signalSendPayloadV2(data) {
+			pubs.Add(1)
+		}
+		return nil
+	}
+	t.Cleanup(func() { v2TestPublishHook = nil })
+
+	sendSubj, err := CommandSubjectV2(mgrClientNodeV2, "SIGNAL.SEND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := requestV2(t, client, sendSubj, encodeFrameV2ForTest(t, mustUUIDV2(t), mustUUIDV2(t), "", map[string]any{
+		"session_id":    ident.SessionID,
+		"connection_id": ident.ConnectionID,
+		"epoch":         ident.Epoch,
+		"seq":           1,
+		"type":          "candidate",
+		"payload":       map[string]any{"candidate": "x"},
+	}))
+	if envelopePayloadMapV2(t, got.Data)["accepted"] != true {
+		t.Fatalf("SEND %s", got.Data)
+	}
+	_ = nextEventV2(t, serverEv, FrameKindSignalSendV2)
+
+	time.Sleep(time.Duration(shortMs+250) * time.Millisecond)
+	failed := requestV2(t, client, sendSubj, encodeFrameV2ForTest(t, mustUUIDV2(t), mustUUIDV2(t), "", map[string]any{
+		"session_id":    ident.SessionID,
+		"connection_id": ident.ConnectionID,
+		"epoch":         ident.Epoch,
+		"seq":           9,
+		"type":          "end_of_candidates",
+		"payload":       map[string]any{},
+	}))
+	code := envelopePayloadMapV2(t, failed.Data)["error"]
+	if code != string(ErrInvalidStateV2) && code != string(ErrSetupTimeoutV2) {
+		t.Fatalf("SEND after deadline must fail connection, got %s", failed.Data)
+	}
+	_ = m.v2.store.Expire(m.now())
+	if hasSignalPendingV2(m, ident) {
+		t.Fatal("store pending must be dropped once deadline fires")
+	}
+
+	n := pubs.Load()
+	time.Sleep(250 * time.Millisecond)
+	if got := pubs.Load(); got != n {
+		t.Fatalf("SIGNAL retries must stop after deadline: before=%d after=%d", n, got)
+	}
+}
+
+func TestManagerV2_SignalRetryStopsAfterRestartAndSessionClose(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	ident, rev := mustCreateBindReadySessionV2(t, client, srv, clientEv, serverEv)
+
+	var mu sync.Mutex
+	var pubs []signalRetryPubV2
+	v2TestPublishHook = func(subj string, data []byte) error {
+		if !signalSendPayloadV2(data) {
+			return nil
+		}
+		p := envelopePayloadMapV2(t, data)
+		mu.Lock()
+		pubs = append(pubs, signalRetryPubV2{at: time.Now(), epoch: uint64(limitVal(p["epoch"]))})
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() { v2TestPublishHook = nil })
+
+	sendSubj, err := CommandSubjectV2(mgrClientNodeV2, "SIGNAL.SEND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := requestV2(t, client, sendSubj, encodeFrameV2ForTest(t, mustUUIDV2(t), mustUUIDV2(t), "", map[string]any{
+		"session_id":    ident.SessionID,
+		"connection_id": ident.ConnectionID,
+		"epoch":         ident.Epoch,
+		"seq":           1,
+		"type":          "candidate",
+		"payload":       map[string]any{"candidate": "old"},
+	}))
+	if envelopePayloadMapV2(t, got.Data)["accepted"] != true {
+		t.Fatalf("SEND %s", got.Data)
+	}
+	_ = nextEventV2(t, serverEv, FrameKindSignalSendV2)
+
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartGot := requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandRestartV2, ident, rev))
+	restartAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, restartGot.Data)
+	if err != nil {
+		t.Fatalf("RESTART: %v body=%s", err, restartGot.Data)
+	}
+	restartIdent := IdentityV2{SessionID: ident.SessionID, ConnectionID: ident.ConnectionID, Epoch: restartAlloc.Allocated.Epoch}
+	_ = requestV2(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandBindV2, restartIdent, restartAlloc.Allocated.Revision))
+	_ = nextEventV2(t, clientEv, FrameKindPrepareV2)
+	_ = nextEventV2(t, serverEv, FrameKindPrepareV2)
+	cut := time.Now()
+	time.Sleep(250 * time.Millisecond)
+	mu.Lock()
+	for _, p := range pubs {
+		if !p.at.Before(cut) && p.epoch == ident.Epoch {
+			t.Fatalf("old-generation SIGNAL retry published after RESTART BIND epoch=%d", p.epoch)
+		}
+	}
+	mu.Unlock()
+
+	closeIdent, _ := mustCreateBindReadySessionV2(t, client, srv, clientEv, serverEv)
+	closeSend := requestV2(t, client, sendSubj, encodeFrameV2ForTest(t, mustUUIDV2(t), mustUUIDV2(t), "", map[string]any{
+		"session_id":    closeIdent.SessionID,
+		"connection_id": closeIdent.ConnectionID,
+		"epoch":         closeIdent.Epoch,
+		"seq":           1,
+		"type":          "description",
+		"payload":       map[string]any{"sdp": "v=0"},
+	}))
+	if envelopePayloadMapV2(t, closeSend.Data)["accepted"] != true {
+		t.Fatalf("close-session SEND %s", closeSend.Data)
+	}
+	_ = nextEventV2(t, serverEv, FrameKindSignalSendV2)
+	sessSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeReply := requestV2(t, client, sessSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandCloseV2, closeIdent, 0))
+	if _, err := DecodeFrameV2(FrameKindErrorV2, closeReply.Data); err == nil {
+		t.Fatalf("SESSION.CLOSE error: %s", closeReply.Data)
+	}
+	_ = nextPayloadV2(t, clientEv)
+	_ = nextPayloadV2(t, serverEv)
+	closeCut := time.Now()
+	time.Sleep(250 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range pubs {
+		if !p.at.Before(closeCut) && p.epoch == closeIdent.Epoch {
+			t.Fatalf("SIGNAL retry published after SESSION.CLOSE epoch=%d", p.epoch)
+		}
+	}
+}
+
+type signalRetryPubV2 struct {
+	at    time.Time
+	epoch uint64
+}
+
+func mustCreateBindReadySessionTimeoutV2(t *testing.T, client, srv *nats.Conn, clientEv, serverEv <-chan *nats.Msg, timeoutMs int64) (IdentityV2, uint64) {
+	t.Helper()
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := requestV2(t, client, createSubj, createFrameV2Timeout(t, mustUUIDV2(t), mgrServerNodeV2, timeoutMs))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{
+		SessionID:    alloc.Allocated.SessionID,
+		ConnectionID: alloc.Allocated.ConnectionID,
+		Epoch:        alloc.Allocated.Epoch,
+	}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision))
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	readySubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvReadySubj, err := CommandSubjectV2(mgrServerNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = requestV2(t, client, readySubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, cPrep.Prepare.Revision))
+	_ = requestV2(t, srv, srvReadySubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, sPrep.Prepare.Revision))
+	cStart := nextEventV2(t, clientEv, FrameKindStartV2)
+	_ = nextEventV2(t, serverEv, FrameKindStartV2)
+	return ident, cStart.Start.Revision
+}
+
+func signalSendPayloadV2(data []byte) bool {
+	var env EnvelopeV2
+	if json.Unmarshal(data, &env) != nil {
+		return false
+	}
+	var payload map[string]any
+	if json.Unmarshal(env.Payload, &payload) != nil {
+		return false
+	}
+	_, hasType := payload["type"]
+	_, hasSeq := payload["seq"]
+	return hasType && hasSeq
+}
+
+func hasSignalPendingV2(m *Manager, ident IdentityV2) bool {
+	dir := DirectionKeyV2{
+		GenerationKeyV2: GenerationKeyV2{SessionID: ident.SessionID, ConnectionID: ident.ConnectionID, Epoch: ident.Epoch},
+		SenderNodeKey:   mgrClientNodeV2,
+	}
+	return m.v2.store.directionPending(dir) > 0
+}
+
 func mustActiveSessionV2From(t *testing.T, s *StoreV2, client, server string) SessionSnapshotV2 {
 	t.Helper()
 	snap, err := s.AllocateSession(client, CreateSessionCommandV2{RequestID: mustUUIDV2(t), ServerNodeKey: server})

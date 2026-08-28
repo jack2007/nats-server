@@ -319,6 +319,9 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
 		return
 	}
+	if cmd.Command == SessionCommandCloseV2 {
+		m.dropSignalRetriesForSessionV2(cmd.SessionID)
+	}
 	if err := m.publishEventsV2(events); err != nil {
 		m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 		return
@@ -344,11 +347,16 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 		}
 		m.replyAllocatedV2(msg, cmd.RequestID, snap)
 	case ConnectionCommandRestartV2:
+		old := GenerationKeyV2{SessionID: cmd.SessionID, ConnectionID: cmd.ConnectionID, Epoch: cmd.Epoch}
 		snap, err := m.v2.store.AllocateRestart(sender, cmd)
 		if err != nil {
 			m.replyConnectionAllocErrV2(msg, cmd, err)
 			return
 		}
+		if old.Epoch == 0 {
+			old.Epoch = snap.Epoch - 1
+		}
+		m.dropSignalRetriesForGenerationV2(old)
 		m.replyAllocatedV2(msg, cmd.RequestID, snap)
 	case ConnectionCommandBindV2:
 		events, err := m.v2.store.BindConnection(sender, cmd)
@@ -387,6 +395,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
 			return
 		}
+		m.dropSignalRetriesForGenerationV2(GenerationKeyV2{SessionID: cmd.SessionID, ConnectionID: cmd.ConnectionID, Epoch: cmd.Epoch})
 		if err := m.publishEventsV2(events); err != nil {
 			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 			return
@@ -485,6 +494,26 @@ func (m *Manager) dropSignalRetriesV2(dir DirectionKeyV2, ackSeq uint64) {
 	}
 }
 
+func (m *Manager) dropSignalRetriesForGenerationV2(gk GenerationKeyV2) {
+	m.v2.retryMu.Lock()
+	defer m.v2.retryMu.Unlock()
+	for k, item := range m.v2.retries {
+		if item.dir.GenerationKeyV2 == gk {
+			delete(m.v2.retries, k)
+		}
+	}
+}
+
+func (m *Manager) dropSignalRetriesForSessionV2(sessionID string) {
+	m.v2.retryMu.Lock()
+	defer m.v2.retryMu.Unlock()
+	for k, item := range m.v2.retries {
+		if item.dir.SessionID == sessionID {
+			delete(m.v2.retries, k)
+		}
+	}
+}
+
 func (m *Manager) wakeSignalRetryV2() {
 	select {
 	case m.v2.retryWake <- struct{}{}:
@@ -510,6 +539,10 @@ func (m *Manager) signalRetryLoopV2() {
 
 func (m *Manager) flushSignalRetriesV2() {
 	now := m.now()
+	if expired := m.v2.store.ExpirePendingSignals(now); len(expired) > 0 {
+		_ = m.publishEventsV2(expired)
+		m.dropSignalRetriesMatchingEventsV2(expired)
+	}
 	var due []signalRetryItemV2
 	m.v2.retryMu.Lock()
 	for k, item := range m.v2.retries {
@@ -521,6 +554,10 @@ func (m *Manager) flushSignalRetriesV2() {
 	}
 	m.v2.retryMu.Unlock()
 	for _, item := range due {
+		deadline, ok := m.v2.store.generationDeadline(item.dir)
+		if !ok || !now.Before(deadline) {
+			continue
+		}
 		ev, ok := m.v2.store.pendingSignal(item.dir, item.seq)
 		if !ok {
 			continue
@@ -529,14 +566,33 @@ func (m *Manager) flushSignalRetriesV2() {
 			ev.TargetNodeKey = item.target
 		}
 		if err := m.publishV2Event(item.target, ev); err != nil {
-			item.attempt++
-			item.next = now.Add(time.Duration(RetryAfterMsV2(item.attempt)) * time.Millisecond)
-			m.requeueSignalRetryV2(item)
+			m.requeueSignalRetryUntilDeadlineV2(item, now, deadline)
 			continue
 		}
-		item.attempt++
-		item.next = now.Add(time.Duration(RetryAfterMsV2(item.attempt)) * time.Millisecond)
-		m.requeueSignalRetryV2(item)
+		m.requeueSignalRetryUntilDeadlineV2(item, now, deadline)
+	}
+}
+
+func (m *Manager) requeueSignalRetryUntilDeadlineV2(item signalRetryItemV2, now, deadline time.Time) {
+	item.attempt++
+	next := now.Add(time.Duration(RetryAfterMsV2(item.attempt)) * time.Millisecond)
+	if !next.Before(deadline) {
+		next = deadline
+	}
+	if !now.Before(deadline) {
+		return
+	}
+	item.next = next
+	m.requeueSignalRetryV2(item)
+}
+
+func (m *Manager) dropSignalRetriesMatchingEventsV2(events []EventV2) {
+	for _, ev := range events {
+		m.dropSignalRetriesForGenerationV2(GenerationKeyV2{
+			SessionID:    ev.Identity.SessionID,
+			ConnectionID: ev.Identity.ConnectionID,
+			Epoch:        ev.Identity.Epoch,
+		})
 	}
 }
 
@@ -663,6 +719,20 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 			"epoch":           event.Identity.Epoch,
 			"revision":        event.Revision,
 			"state":           string(SessionStateClosedV2),
+			"sender_node_key": v2CoordinatorSender,
+		}
+		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
+	case FrameKindErrorV2:
+		code := ErrSetupTimeoutV2
+		if event.Error != nil && event.Error.Code != "" {
+			code = event.Error.Code
+		}
+		payload := map[string]any{
+			"error":           string(code),
+			"session_id":      event.Identity.SessionID,
+			"connection_id":   event.Identity.ConnectionID,
+			"epoch":           event.Identity.Epoch,
+			"revision":        event.Revision,
 			"sender_node_key": v2CoordinatorSender,
 		}
 		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)

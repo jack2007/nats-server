@@ -225,6 +225,14 @@ func (s *StoreV2) hasDirection(dir DirectionKeyV2) bool {
 func (s *StoreV2) pendingSignal(dir DirectionKeyV2, seq uint64) (EventV2, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	sess := s.sessions[dir.SessionID]
+	if sess == nil {
+		return EventV2{}, false
+	}
+	conn := sess.connections[dir.ConnectionID]
+	if conn == nil || conn.epoch != dir.Epoch || conn.state == ConnectionStateClosedV2 {
+		return EventV2{}, false
+	}
 	d := s.directions[dir]
 	if d == nil {
 		return EventV2{}, false
