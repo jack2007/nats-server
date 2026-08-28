@@ -3,6 +3,7 @@ package p2p
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -964,5 +965,181 @@ func TestClusterV2_InternalMutationOwnerRevisionGuard(t *testing.T) {
 	_, still := waitSessionOwnerV2(t, alloc.SessionID, mA, mB, mC)
 	if still != rev {
 		t.Fatalf("guard failed revision %d -> %d", rev, still)
+	}
+}
+
+func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {
+	sA, sB, sC := startClusterTriple(t)
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+	mC, err := StartManager(sC, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mC.Stop)
+	waitClusterPeersN(t, 2, mA, mC)
+
+	client := registerOnServerV2(t, sA, mgrClientNodeV2, newRegistrationIDV2(t))
+	_ = registerOnServerV2(t, sC, mgrServerNodeV2, newRegistrationIDV2(t))
+
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqID := mustUUIDV2(t)
+	got := requestV2Wait(t, client, createSubj, createFrameV2(t, reqID, mgrServerNodeV2), 5*time.Second)
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatalf("CREATE: %v body=%s", err, got.Data)
+	}
+	ident := IdentityV2{
+		SessionID:    alloc.Allocated.SessionID,
+		ConnectionID: alloc.Allocated.ConnectionID,
+		Epoch:        alloc.Allocated.Epoch,
+	}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := requestV2Wait(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision), 5*time.Second)
+	if !bytesContainsOK(bind.Data) {
+		t.Fatalf("BIND: %s", bind.Data)
+	}
+
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mB.Stop)
+
+	wantOwner := alloc.Allocated.OwnerServerID
+	deadline := time.Now().Add(8 * time.Second)
+	joined := false
+	for time.Now().Before(deadline) {
+		if mB.joinedQueueGroupV2() {
+			joined = true
+			o, _, ok := mB.SessionOwnerV2(alloc.Allocated.SessionID)
+			if !ok || o != wantOwner || o == mB.serverID {
+				t.Fatalf("B joined COORDINATORS without snapshotting peer: ok=%v owner=%s want %s", ok, o, wantOwner)
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !joined {
+		t.Fatal("B never joined after peer snapshot catch-up")
+	}
+
+	mA.dropQueueGroupV2()
+	mC.dropQueueGroupV2()
+	retry := requestV2Wait(t, client, createSubj, createFrameV2(t, reqID, mgrServerNodeV2), 5*time.Second)
+	again, err := DecodeFrameV2(FrameKindAllocatedV2, retry.Data)
+	if err != nil {
+		t.Fatalf("retry CREATE after late join: %v body=%s", err, retry.Data)
+	}
+	if again.Allocated.SessionID != alloc.Allocated.SessionID {
+		t.Fatalf("B minted second session %s vs %s", again.Allocated.SessionID, alloc.Allocated.SessionID)
+	}
+	if again.Allocated.OwnerServerID == mB.serverID {
+		t.Fatal("B became second owner for A's request_id")
+	}
+	if o, _, ok := mB.SessionOwnerV2(alloc.Allocated.SessionID); !ok || o == mB.serverID {
+		t.Fatalf("B owner map after retry: ok=%v owner=%s", ok, o)
+	}
+}
+
+func TestClusterV2_CreateRetryUnsyncedMemberNoSecondOwner(t *testing.T) {
+	sA, sB := startClusterPair(t)
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+
+	hold := make(chan struct{})
+	v2TestHoldJoinQueue = hold
+	v2TestDropSessionSync = true
+	t.Cleanup(func() {
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
+		v2TestHoldJoinQueue = nil
+		v2TestDropSessionSync = false
+		v2TestDropSessionSyncNode = ""
+	})
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mB.Stop)
+	v2TestHoldJoinQueue = nil
+	v2TestDropSessionSyncNode = mB.serverID
+	waitClusterPeers(t, mA, mB)
+	if mB.joinedQueueGroupV2() {
+		t.Fatal("B must stay off COORDINATORS until after CREATE")
+	}
+
+	client := registerOnServerV2(t, sA, mgrClientNodeV2, newRegistrationIDV2(t))
+	_ = registerOnServerV2(t, sB, mgrServerNodeV2, newRegistrationIDV2(t))
+
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqID := mustUUIDV2(t)
+	got := requestV2Wait(t, client, createSubj, createFrameV2(t, reqID, mgrServerNodeV2), 5*time.Second)
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatalf("CREATE: %v body=%s", err, got.Data)
+	}
+	if _, _, ok := mB.SessionOwnerV2(alloc.Allocated.SessionID); ok {
+		t.Fatal("dropped SYNC must leave B without the session")
+	}
+
+	close(hold)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !mB.joinedQueueGroupV2() {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !mB.joinedQueueGroupV2() {
+		t.Fatal("B must join COORDINATORS before CREATE retry")
+	}
+	mA.dropQueueGroupV2()
+	fwd, err := json.Marshal(v2ForwardedCmd{Subject: createSubj, Data: createFrameV2(t, reqID, mgrServerNodeV2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys := sysConnV2(t, sB)
+	retry := requestV2Wait(t, sys, v2MgrCommandSubject(mB.serverID), fwd, 5*time.Second)
+	if again, err := DecodeFrameV2(FrameKindAllocatedV2, retry.Data); err == nil {
+		if again.Allocated.SessionID != alloc.Allocated.SessionID {
+			t.Fatalf("unsynced member minted session %s vs %s", again.Allocated.SessionID, alloc.Allocated.SessionID)
+		}
+		if again.Allocated.OwnerServerID == mB.serverID {
+			t.Fatal("B became second owner on CREATE retry")
+		}
+	} else {
+		perr := mustErrorV2(t, retry.Data)
+		if perr.Code != ErrBusyV2 && perr.Code != ErrCoordinatorUnavailableV2 {
+			t.Fatalf("CREATE retry on unsynced member want busy/forward, got %+v %s", perr, retry.Data)
+		}
+	}
+
+	mB.v2.mu.Lock()
+	sid := mB.v2.requests[RequestKeyV2{SenderNodeKey: mgrClientNodeV2, RequestID: reqID}]
+	meta := mB.v2.owners[sid]
+	mB.v2.mu.Unlock()
+	if meta != nil && meta.Owner == mB.serverID && sid != alloc.Allocated.SessionID {
+		t.Fatalf("B locally allocated second session %s owner=%s", sid, meta.Owner)
+	}
+	if o, _, ok := mA.SessionOwnerV2(alloc.Allocated.SessionID); !ok || o != mA.serverID {
+		t.Fatalf("A lost original ownership: ok=%v owner=%s", ok, o)
 	}
 }

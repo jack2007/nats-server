@@ -25,17 +25,19 @@ const (
 )
 
 var (
-	v2TestOnCommand        func(string)
-	v2TestQueueSize        int
-	v2TestWorkers          int
-	v2TestBlock            func()
-	v2TestPublishHook      func(subj string, data []byte) error
-	v2TestHoldJoinQueue     <-chan struct{}
-	v2TestHoldRegisterSync  <-chan struct{}
-	v2TestHoldRegisterApply <-chan struct{}
-	v2TestHoldRegisterNode  string
-	v2TestBeforeCatchUp     func(*Manager)
-	v2TestCatchUpExtraNeed  int
+	v2TestOnCommand           func(string)
+	v2TestQueueSize           int
+	v2TestWorkers             int
+	v2TestBlock               func()
+	v2TestPublishHook         func(subj string, data []byte) error
+	v2TestHoldJoinQueue       <-chan struct{}
+	v2TestHoldRegisterSync    <-chan struct{}
+	v2TestHoldRegisterApply   <-chan struct{}
+	v2TestHoldRegisterNode    string
+	v2TestBeforeCatchUp       func(*Manager)
+	v2TestCatchUpExtraNeed    int
+	v2TestDropSessionSync     bool
+	v2TestDropSessionSyncNode string
 )
 
 type v2NodeBinding struct {
@@ -363,17 +365,30 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 	key := RequestKeyV2{SenderNodeKey: sender, RequestID: dec.Create.RequestID}
 	m.v2.mu.Lock()
 	if sid, ok := m.v2.requests[key]; ok {
-		meta := m.v2.owners[sid]
-		m.v2.mu.Unlock()
-		if meta != nil {
-			if meta.Owner == m.serverID {
-				_ = m.syncSessionLockedV2(meta.SessionID, dec.Create.RequestID, sender)
-			}
-			m.replyAllocatedOwnerV2(msg, dec.Create.RequestID, meta)
+		if meta := m.v2.owners[sid]; meta != nil {
+			m.v2.mu.Unlock()
+			m.replyKnownCreateOwnerV2(msg, sender, dec.Create.RequestID, meta)
 			return
 		}
-	} else {
-		m.v2.mu.Unlock()
+	}
+	for _, meta := range m.v2.owners {
+		if meta != nil && meta.RequestID == dec.Create.RequestID &&
+			(meta.ClientNode == "" || meta.ClientNode == sender) {
+			m.v2.mu.Unlock()
+			m.replyKnownCreateOwnerV2(msg, sender, dec.Create.RequestID, meta)
+			return
+		}
+	}
+	m.v2.mu.Unlock()
+	peer, err := m.lookupPeerCreateOwnerV2(sender, dec.Create.RequestID)
+	if err != nil {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, dec.Create.RequestID, ErrBusyV2, &ms)
+		return
+	}
+	if peer != nil {
+		m.replyKnownCreateOwnerV2(msg, sender, dec.Create.RequestID, peer)
+		return
 	}
 	snap, err := m.v2.store.AllocateSession(sender, *dec.Create)
 	if err != nil {
@@ -1157,6 +1172,106 @@ func (m *Manager) forwardV2Command(msg *nats.Msg, owner string) error {
 		_ = msg.Respond(reply.Data)
 	}
 	return nil
+}
+
+func (m *Manager) replyKnownCreateOwnerV2(msg *nats.Msg, sender, requestID string, meta *v2SessionMeta) {
+	_ = sender
+	m.replyAllocatedOwnerV2(msg, requestID, meta)
+}
+
+func mutationSessionMetaV2(mut v2MgrMutation) v2SessionMeta {
+	return v2SessionMeta{
+		SessionID:      mut.SessionID,
+		Owner:          mut.Owner,
+		Revision:       mut.Revision,
+		RequestID:      mut.RequestID,
+		ClientNode:     mut.ClientNodeKey,
+		ServerNode:     mut.ServerNodeKey,
+		State:          SessionStateV2(mut.State),
+		ConnectionID:   mut.ConnectionID,
+		Epoch:          mut.Epoch,
+		SetupTimeoutMs: mut.SetupTimeoutMs,
+	}
+}
+
+func (m *Manager) lookupPeerCreateOwnerV2(sender, requestID string) (*v2SessionMeta, error) {
+	if m.peers == nil {
+		return nil, nil
+	}
+	others := m.catchUpPeerCountV2()
+	if others == 0 && !m.inCluster() {
+		return nil, nil
+	}
+	type lookupResult struct {
+		meta *v2SessionMeta
+		err  error
+	}
+	ch := make(chan lookupResult, 1)
+	go func() {
+		meta, err := m.collectPeerCreateOwnerV2(sender, requestID, others)
+		ch <- lookupResult{meta, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.meta, r.err
+	case <-time.After(v2ClusterSyncTimeout):
+		return nil, errV2SyncTimeout
+	}
+}
+
+func (m *Manager) collectPeerCreateOwnerV2(sender, requestID string, others int) (*v2SessionMeta, error) {
+	nc := m.mgrConn()
+	inbox := nc.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		return nil, err
+	}
+	defer sub.Unsubscribe()
+	if err := nc.PublishRequest(subjectV2MgrSnapshot, inbox, []byte(m.serverID)); err != nil {
+		return nil, err
+	}
+	need := others
+	if need < 1 {
+		need = 1
+	}
+	deadline := time.Now().Add(v2ClusterSyncTimeout)
+	got := 0
+	var found *v2SessionMeta
+	for got < need {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		msg, err := sub.NextMsg(remaining)
+		if err != nil {
+			break
+		}
+		var snap v2SnapshotReply
+		if json.Unmarshal(msg.Data, &snap) != nil {
+			continue
+		}
+		if snap.Sender == m.serverID {
+			continue
+		}
+		got++
+		for _, mut := range snap.Sessions {
+			if mut.RequestID != requestID || mut.Owner == "" {
+				continue
+			}
+			if mut.ClientNodeKey != "" && mut.ClientNodeKey != sender {
+				continue
+			}
+			meta := mutationSessionMetaV2(mut)
+			found = &meta
+		}
+	}
+	if found != nil {
+		return found, nil
+	}
+	if got < need {
+		return nil, errV2SyncTimeout
+	}
+	return nil, nil
 }
 
 func (m *Manager) replyAllocatedOwnerV2(msg *nats.Msg, requestID string, meta *v2SessionMeta) {

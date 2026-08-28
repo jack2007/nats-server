@@ -505,14 +505,15 @@ func (m *Manager) publishRelease(account, nodeKey, connName, claimID string) {
 }
 
 const (
-	subjectV2MgrSync     = "$P2P.V2.MGR.SYNC"
-	subjectV2MgrSnapshot = "$P2P.V2.MGR.SNAPSHOT"
-	subjectV2MgrLost     = "$P2P.V2.MGR.OWNERLOST"
-	v2ClusterSyncTimeout = time.Second
-	v2MutationRegister   = "register"
-	v2MutationSession    = "session"
-	v2MutationOwnerLost  = "owner_lost"
-	v2MutationLeave      = "leave"
+	subjectV2MgrSync         = "$P2P.V2.MGR.SYNC"
+	subjectV2MgrSnapshot     = "$P2P.V2.MGR.SNAPSHOT"
+	subjectV2MgrLost         = "$P2P.V2.MGR.OWNERLOST"
+	v2ClusterSyncTimeout     = time.Second
+	v2CatchUpDiscoverTimeout = time.Second
+	v2MutationRegister       = "register"
+	v2MutationSession        = "session"
+	v2MutationOwnerLost      = "owner_lost"
+	v2MutationLeave          = "leave"
 )
 
 func NodeDisconnectGraceDuration(pingInterval time.Duration, pingMax int) time.Duration {
@@ -569,6 +570,7 @@ type v2ForwardedCmd struct {
 }
 
 type v2SnapshotReply struct {
+	Sender   string          `json:"sender,omitempty"`
 	Nodes    []v2MgrMutation `json:"nodes"`
 	Sessions []v2MgrMutation `json:"sessions"`
 }
@@ -618,16 +620,34 @@ func (m *Manager) startClusterV2() error {
 	return nc.Flush()
 }
 
+func (m *Manager) catchUpPeerCountV2() int {
+	if m.peers == nil {
+		return 0
+	}
+	n := 0
+	for _, id := range m.peers.alive(m.now()) {
+		if id != m.serverID {
+			n++
+		}
+	}
+	return n
+}
+
+func (m *Manager) applySnapshotReplyV2(snap v2SnapshotReply) {
+	for _, mut := range snap.Nodes {
+		_ = m.applyMutationV2(mut)
+	}
+	for _, mut := range snap.Sessions {
+		_ = m.applyMutationV2(mut)
+	}
+}
+
 func (m *Manager) catchUpV2() error {
 	if v2TestBeforeCatchUp != nil {
 		v2TestBeforeCatchUp(m)
 	}
 	extra := v2TestCatchUpExtraNeed
 	if m.peers == nil {
-		return nil
-	}
-	alive := m.peers.alive(m.now())
-	if extra == 0 && (!m.inCluster() && len(alive) <= 1 || len(alive) <= 1) {
 		return nil
 	}
 	nc := m.mgrConn()
@@ -640,14 +660,17 @@ func (m *Manager) catchUpV2() error {
 	if err := nc.PublishRequest(subjectV2MgrSnapshot, inbox, []byte(m.serverID)); err != nil {
 		return err
 	}
-	deadline := m.now().Add(v2ClusterSyncTimeout)
-	need := len(alive) - 1
-	if need < 1 {
-		need = 1
+	discover := v2CatchUpDiscoverTimeout
+	if extra == 0 && !m.inCluster() {
+		discover = 50 * time.Millisecond
 	}
-	need += extra
+	deadline := m.now().Add(discover)
+	if extra > 0 {
+		deadline = m.now().Add(v2ClusterSyncTimeout)
+	}
 	got := 0
-	for got < need {
+	peerSnap := false
+	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
@@ -660,14 +683,30 @@ func (m *Manager) catchUpV2() error {
 		if json.Unmarshal(msg.Data, &snap) != nil {
 			continue
 		}
-		for _, mut := range snap.Nodes {
-			_ = m.applyMutationV2(mut)
+		if snap.Sender == m.serverID {
+			continue
 		}
-		for _, mut := range snap.Sessions {
-			_ = m.applyMutationV2(mut)
-		}
+		m.applySnapshotReplyV2(snap)
 		got++
+		peerSnap = true
+		need := m.catchUpPeerCountV2()
+		if need < 1 {
+			need = 1
+		}
+		need += extra
+		if extra == 0 && got >= need {
+			return nil
+		}
 	}
+	others := m.catchUpPeerCountV2()
+	if extra == 0 && others == 0 && !peerSnap {
+		return nil
+	}
+	need := others
+	if need < 1 {
+		need = 1
+	}
+	need += extra
 	if got < need {
 		return errV2CatchUpIncomplete
 	}
@@ -791,6 +830,13 @@ func (m *Manager) handleV2MgrSync(msg *nats.Msg) {
 		}
 		return
 	}
+	if v2TestDropSessionSync && mut.Kind == v2MutationSession && mut.Sender != m.serverID &&
+		(v2TestDropSessionSyncNode == "" || v2TestDropSessionSyncNode == m.serverID) {
+		if msg.Reply != "" {
+			_ = msg.Respond(m.encodeV2MgrAck(true, mut.MutationID))
+		}
+		return
+	}
 	holdApply := v2TestHoldRegisterApply
 	holdNode := v2TestHoldRegisterNode
 	if mut.Kind == v2MutationRegister && mut.Sender != m.serverID && holdApply != nil &&
@@ -845,6 +891,9 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 	if m.v2 == nil {
 		return
 	}
+	if string(msg.Data) == m.serverID {
+		return
+	}
 	var nodes []v2MgrMutation
 	var sessions []v2MgrMutation
 	m.v2.mu.Lock()
@@ -883,7 +932,7 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 		})
 	}
 	m.v2.mu.Unlock()
-	body, err := json.Marshal(v2SnapshotReply{Nodes: nodes, Sessions: sessions})
+	body, err := json.Marshal(v2SnapshotReply{Sender: m.serverID, Nodes: nodes, Sessions: sessions})
 	if err != nil || msg.Reply == "" {
 		return
 	}
@@ -906,7 +955,12 @@ func (m *Manager) handleV2MgrCommand(msg *nats.Msg) {
 	}
 	msg.Subject = fwd.Subject
 	msg.Data = fwd.Data
-	m.dispatchV2(msg)
+	select {
+	case m.v2.cmdQ <- msg:
+	default:
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrBusyV2, &ms)
+	}
 }
 
 func (m *Manager) handleV2OwnerLost(msg *nats.Msg) {
@@ -1138,7 +1192,7 @@ func (m *Manager) syncSessionLockedV2(sessionID, requestID, sender string) error
 	meta.ServerNode = snap.ServerNodeKey
 	meta.ConnectionID = snap.ConnectionID
 	meta.Epoch = snap.Epoch
-	if requestID != "" {
+	if requestID != "" && meta.RequestID == "" {
 		meta.RequestID = requestID
 	}
 	if sender != "" && meta.ClientNode == "" {
