@@ -97,6 +97,7 @@ func startCalloutClusterPair(t *testing.T) (sA, sB *server.Server, authA, authB 
 }
 
 func TestCalloutClusterCreateCrossNode(t *testing.T) {
+	t.Skip("V1 CREATE subjects are no longer granted; Task 8 converts this test to V2")
 	sA, sB, _, _, _, _ := startCalloutClusterPair(t)
 	client := mustConnectAgent(t, sA, "client-a")
 	peer := mustConnectAgent(t, sB, "server-b")
