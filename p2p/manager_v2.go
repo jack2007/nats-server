@@ -25,17 +25,23 @@ const (
 )
 
 var (
-	v2TestOnCommand   func(string)
-	v2TestQueueSize   int
-	v2TestWorkers     int
-	v2TestBlock       func()
-	v2TestPublishHook func(subj string, data []byte) error
+	v2TestOnCommand        func(string)
+	v2TestQueueSize        int
+	v2TestWorkers          int
+	v2TestBlock            func()
+	v2TestPublishHook      func(subj string, data []byte) error
+	v2TestHoldJoinQueue    <-chan struct{}
+	v2TestHoldRegisterSync <-chan struct{}
+	v2TestHoldRegisterNode string
 )
 
 type v2NodeBinding struct {
 	registrationID string
 	epoch          uint64
 	cid            uint64
+	natsServerID   string
+	requestID      string
+	pending        bool
 }
 
 type signalRetryItemV2 struct {
@@ -48,17 +54,25 @@ type signalRetryItemV2 struct {
 }
 
 type managerV2 struct {
-	store     *StoreV2
-	cmdQ      chan *nats.Msg
-	stop      chan struct{}
-	wg        sync.WaitGroup
-	subs      []*nats.Subscription
-	mu        sync.Mutex
-	nodes     map[string]*v2NodeBinding
-	sessionMu sync.Map
-	retryMu   sync.Mutex
-	retries   map[MessageKeyV2]signalRetryItemV2
-	retryWake chan struct{}
+	store           *StoreV2
+	cmdQ            chan *nats.Msg
+	stop            chan struct{}
+	wg              sync.WaitGroup
+	subs            []*nats.Subscription
+	cmdSubs         []*nats.Subscription
+	mgrSubs         []*nats.Subscription
+	mu              sync.Mutex
+	nodes           map[string]*v2NodeBinding
+	owners          map[string]*v2SessionMeta
+	requests        map[RequestKeyV2]string
+	applied         map[string]struct{}
+	registerSyncing int
+	joinedQueue     bool
+	unreachable     bool
+	sessionMu       sync.Map
+	retryMu         sync.Mutex
+	retries         map[MessageKeyV2]signalRetryItemV2
+	retryWake       chan struct{}
 }
 
 func RetryAfterMsV2(attempt int) int64 {
@@ -107,6 +121,9 @@ func (m *Manager) startV2() error {
 		cmdQ:      make(chan *nats.Msg, qsize),
 		stop:      make(chan struct{}),
 		nodes:     make(map[string]*v2NodeBinding),
+		owners:    make(map[string]*v2SessionMeta),
+		requests:  make(map[RequestKeyV2]string),
+		applied:   make(map[string]struct{}),
 		retries:   make(map[MessageKeyV2]signalRetryItemV2),
 		retryWake: make(chan struct{}, 1),
 	}
@@ -116,18 +133,11 @@ func (m *Manager) startV2() error {
 		return err
 	}
 	m.v2.subs = append(m.v2.subs, sub)
-	for _, suffix := range []string{
-		"SESSION.CREATE",
-		"SESSION.COMMAND",
-		"CONNECTION.COMMAND",
-		"SIGNAL.SEND",
-		"SIGNAL.ACK",
-	} {
-		sub, err = m.nc.QueueSubscribe("$P2P.V2.CMD.*."+suffix, v2CoordinatorQueue, m.handleV2Command)
-		if err != nil {
-			return err
-		}
-		m.v2.subs = append(m.v2.subs, sub)
+	if err := m.startClusterV2(); err != nil {
+		return err
+	}
+	if err := m.catchUpV2(); err != nil {
+		return err
 	}
 	for i := 0; i < workers; i++ {
 		m.v2.wg.Add(1)
@@ -135,12 +145,34 @@ func (m *Manager) startV2() error {
 	}
 	m.v2.wg.Add(1)
 	go m.signalRetryLoopV2()
+	if v2TestHoldJoinQueue != nil {
+		hold := v2TestHoldJoinQueue
+		m.v2.wg.Add(1)
+		go func() {
+			defer m.v2.wg.Done()
+			select {
+			case <-hold:
+			case <-m.v2.stop:
+				return
+			}
+			_ = m.joinExternalQueueV2()
+		}()
+	} else if err := m.joinExternalQueueV2(); err != nil {
+		return err
+	}
 	return m.nc.Flush()
 }
 
 func (m *Manager) stopV2() {
 	if m == nil || m.v2 == nil {
 		return
+	}
+	m.publishOwnerExitV2()
+	for _, sub := range m.v2.mgrSubs {
+		_ = sub.Unsubscribe()
+	}
+	for _, sub := range m.v2.cmdSubs {
+		_ = sub.Unsubscribe()
 	}
 	for _, sub := range m.v2.subs {
 		_ = sub.Unsubscribe()
@@ -167,6 +199,11 @@ func (m *Manager) handleV2Command(msg *nats.Msg) {
 	}
 	if strings.HasPrefix(suffix, "REGISTER.") {
 		m.handleRegisterV2(msg, sender, suffix)
+		return
+	}
+	if m.v2ExternalBlocked(sender) {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrBusyV2, &ms)
 		return
 	}
 	select {
@@ -202,6 +239,11 @@ func (m *Manager) dispatchV2(msg *nats.Msg) {
 	if err != nil {
 		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrInvalidRequestV2, nil)
 		return
+	}
+	if suffix != "SESSION.CREATE" {
+		if sid := sessionIDFromV2Data(msg.Data); sid != "" && m.maybeForwardV2(msg, sid) {
+			return
+		}
 	}
 	switch suffix {
 	case "SESSION.CREATE":
@@ -240,25 +282,51 @@ func (m *Manager) handleRegisterV2(msg *nats.Msg, sender, suffix string) {
 	cid := cids[0]
 	m.v2.mu.Lock()
 	if existing, ok := m.v2.nodes[sender]; ok {
-		if existing.registrationID == cmd.RegistrationID && existing.cid != cid {
+		if existing.registrationID == cmd.RegistrationID && existing.cid != 0 && existing.cid != cid {
 			m.v2.mu.Unlock()
 			m.replyV2Error(msg, cmd.RequestID, ErrInvalidRequestV2, nil)
 			return
 		}
 	}
+	m.v2.registerSyncing++
 	m.v2.mu.Unlock()
+	defer func() {
+		m.v2.mu.Lock()
+		if m.v2.registerSyncing > 0 {
+			m.v2.registerSyncing--
+		}
+		m.v2.mu.Unlock()
+	}()
 	snap, err := m.v2.store.RegisterNode(cmd)
 	if err != nil {
 		m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
 		return
 	}
-	m.v2.mu.Lock()
-	m.v2.nodes[sender] = &v2NodeBinding{
-		registrationID: snap.RegistrationID,
-		epoch:          snap.RegistrationEpoch,
-		cid:            cid,
+	pendingMut := v2MgrMutation{
+		Kind:              v2MutationRegister,
+		Owner:             m.serverID,
+		RequestID:         cmd.RequestID,
+		NodeKey:           sender,
+		RegistrationID:    snap.RegistrationID,
+		RegistrationEpoch: snap.RegistrationEpoch,
+		CID:               cid,
+		NatsServerID:      m.serverID,
+		Pending:           true,
 	}
-	m.v2.mu.Unlock()
+	if err := m.syncMutationV2(pendingMut); err != nil {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, cmd.RequestID, ErrBusyV2, &ms)
+		return
+	}
+	finalMut := pendingMut
+	finalMut.MutationID = ""
+	finalMut.MessageID = ""
+	finalMut.Pending = false
+	if err := m.syncMutationV2(finalMut); err != nil {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, cmd.RequestID, ErrBusyV2, &ms)
+		return
+	}
 	body, err := encodeEnvelopeV2(cmd.RequestID, "", snap.RegistrationID, map[string]any{
 		"registration_epoch": snap.RegistrationEpoch,
 	})
@@ -281,9 +349,48 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 			return
 		}
 	}
+	key := RequestKeyV2{SenderNodeKey: sender, RequestID: dec.Create.RequestID}
+	m.v2.mu.Lock()
+	if sid, ok := m.v2.requests[key]; ok {
+		meta := m.v2.owners[sid]
+		m.v2.mu.Unlock()
+		if meta != nil {
+			if meta.Owner == m.serverID {
+				_ = m.syncSessionLockedV2(meta.SessionID, dec.Create.RequestID, sender)
+			}
+			m.replyAllocatedOwnerV2(msg, dec.Create.RequestID, meta)
+			return
+		}
+	} else {
+		m.v2.mu.Unlock()
+	}
 	snap, err := m.v2.store.AllocateSession(sender, *dec.Create)
 	if err != nil {
 		m.replyV2Error(msg, dec.Create.RequestID, protocolCodeV2(err), nil)
+		return
+	}
+	timeoutMs := DefaultSetupTimeoutV2.Milliseconds()
+	if dec.Create.TotalTimeoutMs != 0 {
+		timeoutMs = dec.Create.TotalTimeoutMs
+	}
+	m.v2.mu.Lock()
+	m.v2.owners[snap.SessionID] = &v2SessionMeta{
+		SessionID:      snap.SessionID,
+		Owner:          m.serverID,
+		Revision:       snap.Revision,
+		RequestID:      dec.Create.RequestID,
+		ClientNode:     snap.ClientNodeKey,
+		ServerNode:     snap.ServerNodeKey,
+		State:          snap.State,
+		ConnectionID:   snap.ConnectionID,
+		Epoch:          snap.Epoch,
+		SetupTimeoutMs: timeoutMs,
+	}
+	m.v2.requests[key] = snap.SessionID
+	m.v2.mu.Unlock()
+	if err := m.syncSessionLockedV2(snap.SessionID, dec.Create.RequestID, sender); err != nil {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, dec.Create.RequestID, ErrBusyV2, &ms)
 		return
 	}
 	body, err := encodeEnvelopeV2(dec.Create.RequestID, "", "", map[string]any{
@@ -326,6 +433,7 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 		m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 		return
 	}
+	_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
 	m.replyV2OK(msg, cmd.RequestID)
 }
 
@@ -345,6 +453,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyConnectionAllocErrV2(msg, cmd, err)
 			return
 		}
+		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
 		m.replyAllocatedV2(msg, cmd.RequestID, snap)
 	case ConnectionCommandRestartV2:
 		old := GenerationKeyV2{SessionID: cmd.SessionID, ConnectionID: cmd.ConnectionID, Epoch: cmd.Epoch}
@@ -357,6 +466,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			old.Epoch = snap.Epoch - 1
 		}
 		m.dropSignalRetriesForGenerationV2(old)
+		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
 		m.replyAllocatedV2(msg, cmd.RequestID, snap)
 	case ConnectionCommandBindV2:
 		events, err := m.v2.store.BindConnection(sender, cmd)
@@ -371,6 +481,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 			return
 		}
+		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
 		m.replyV2OK(msg, cmd.RequestID)
 	case ConnectionCommandReadyV2:
 		events, err := m.v2.store.MarkConnectionReady(sender, cmd)
@@ -385,6 +496,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 			return
 		}
+		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
 		m.replyV2OK(msg, cmd.RequestID)
 	case ConnectionCommandCloseV2:
 		events, err := m.v2.store.CloseConnection(sender, cmd)
@@ -400,6 +512,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
 			return
 		}
+		_ = m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
 		m.replyV2OK(msg, cmd.RequestID)
 	default:
 		m.replyV2Error(msg, cmd.RequestID, ErrInvalidStateV2, nil)
@@ -956,6 +1069,153 @@ func requestIDFromData(data []byte) string {
 		return ""
 	}
 	return env.RequestID
+}
+
+func (m *Manager) v2ExternalBlocked(sender string) bool {
+	if m.v2 == nil {
+		return false
+	}
+	m.v2.mu.Lock()
+	defer m.v2.mu.Unlock()
+	if m.v2.registerSyncing > 0 {
+		return true
+	}
+	if b, ok := m.v2.nodes[sender]; ok && b.pending {
+		return true
+	}
+	return false
+}
+
+func (m *Manager) maybeForwardV2(msg *nats.Msg, sessionID string) bool {
+	m.v2.mu.Lock()
+	meta, ok := m.v2.owners[sessionID]
+	m.v2.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if meta.Lost || meta.Owner == "" {
+		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrSessionNotFoundV2, nil)
+		return true
+	}
+	if meta.Owner == m.serverID {
+		return false
+	}
+	if err := m.forwardV2Command(msg, meta.Owner); err != nil {
+		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrCoordinatorUnavailableV2, nil)
+	}
+	return true
+}
+
+func (m *Manager) forwardV2Command(msg *nats.Msg, owner string) error {
+	body, err := json.Marshal(v2ForwardedCmd{Subject: msg.Subject, Data: msg.Data})
+	if err != nil {
+		return err
+	}
+	reply, err := m.mgrConn().Request(v2MgrCommandSubject(owner), body, v2ClusterSyncTimeout)
+	if err != nil {
+		return err
+	}
+	if msg.Reply != "" {
+		_ = msg.Respond(reply.Data)
+	}
+	return nil
+}
+
+func (m *Manager) replyAllocatedOwnerV2(msg *nats.Msg, requestID string, meta *v2SessionMeta) {
+	state := string(meta.State)
+	if state == "" {
+		state = string(SessionStateAllocatedV2)
+	}
+	connID := meta.ConnectionID
+	if connID == "" {
+		connID = "conn-0"
+	}
+	epoch := meta.Epoch
+	if epoch == 0 {
+		epoch = 1
+	}
+	rev := meta.Revision
+	if rev == 0 {
+		rev = 1
+	}
+	body, err := encodeEnvelopeV2(requestID, "", "", map[string]any{
+		"ok":              true,
+		"session_id":      meta.SessionID,
+		"connection_id":   connID,
+		"epoch":           epoch,
+		"state":           state,
+		"revision":        rev,
+		"owner_server_id": meta.Owner,
+	})
+	if err != nil {
+		m.replyV2Error(msg, requestID, ErrInternalErrorV2, nil)
+		return
+	}
+	_ = msg.Respond(body)
+}
+
+func (m *Manager) SessionOwnerV2(sessionID string) (string, uint64, bool) {
+	if m == nil || m.v2 == nil {
+		return "", 0, false
+	}
+	m.v2.mu.Lock()
+	defer m.v2.mu.Unlock()
+	meta, ok := m.v2.owners[sessionID]
+	if !ok || meta.Owner == "" {
+		return "", 0, false
+	}
+	return meta.Owner, meta.Revision, true
+}
+
+func (m *Manager) dropQueueGroupV2() {
+	if m == nil || m.v2 == nil {
+		return
+	}
+	for _, sub := range m.v2.cmdSubs {
+		_ = sub.Unsubscribe()
+	}
+	m.v2.cmdSubs = nil
+	m.v2.mu.Lock()
+	m.v2.joinedQueue = false
+	m.v2.mu.Unlock()
+}
+
+func (m *Manager) setOwnerUnreachableV2(v bool) {
+	if m == nil || m.v2 == nil {
+		return
+	}
+	m.v2.mu.Lock()
+	m.v2.unreachable = v
+	m.v2.mu.Unlock()
+}
+
+func (m *Manager) joinedQueueGroupV2() bool {
+	if m == nil || m.v2 == nil {
+		return false
+	}
+	m.v2.mu.Lock()
+	defer m.v2.mu.Unlock()
+	return m.v2.joinedQueue
+}
+
+func (m *Manager) forgetSessionOwnerV2(sessionID string) {
+	if m == nil || m.v2 == nil {
+		return
+	}
+	m.v2.mu.Lock()
+	delete(m.v2.owners, sessionID)
+	m.v2.mu.Unlock()
+	m.v2.store.mu.Lock()
+	delete(m.v2.store.sessions, sessionID)
+	m.v2.store.mu.Unlock()
+}
+
+func (m *Manager) injectV2Disconnect(node string, cid uint64) {
+	body, _ := json.Marshal(map[string]any{"client": map[string]any{"name": node, "id": cid}})
+	m.handleDisconnectV2(&nats.Msg{
+		Subject: "$SYS.ACCOUNT." + m.agentAccount() + ".DISCONNECT",
+		Data:    body,
+	})
 }
 
 func protocolCodeV2(err error) ErrorCodeV2 {

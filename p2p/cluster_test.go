@@ -452,3 +452,24 @@ func TestClusterHeartbeatDropServerAllowsReregister(t *testing.T) {
 		t.Fatalf("re-register after DropServer: %s", msg.Data)
 	}
 }
+
+func TestClusterV2_NodeDisconnectGraceAndTombstone(t *testing.T) {
+	if got := NodeDisconnectGraceDuration(0, 0); got != 15*time.Second {
+		t.Fatalf("zero ping grace=%s want 15s", got)
+	}
+	if got := NodeDisconnectGraceDuration(5*time.Second, 3); got != 20*time.Second {
+		t.Fatalf("ping 5s*4 grace=%s want 20s", got)
+	}
+	if got := NodeDisconnectGraceDuration(2*time.Second, 2); got != 15*time.Second {
+		t.Fatalf("small ping grace=%s want max(15s, 6s)=15s", got)
+	}
+	if got := TombstoneDuration(0); got != 60*time.Second {
+		t.Fatalf("zero tombstone=%s want 60s", got)
+	}
+	if got := TombstoneDuration(10 * time.Second); got != 60*time.Second {
+		t.Fatalf("short timeout tombstone=%s want 60s", got)
+	}
+	if got := TombstoneDuration(45 * time.Second); got != 90*time.Second {
+		t.Fatalf("long timeout tombstone=%s want 90s", got)
+	}
+}
