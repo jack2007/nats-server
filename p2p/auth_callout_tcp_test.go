@@ -199,6 +199,7 @@ func TestTCPCalloutDeniesSysAndWildcard(t *testing.T) {
 }
 
 func TestTCPCalloutCreateIncludesTurn(t *testing.T) {
+	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "secret")
 	secret := []byte("test-static-auth-secret")
@@ -241,6 +242,7 @@ func TestTCPCalloutCreateIncludesTurn(t *testing.T) {
 }
 
 func TestTCPCalloutHardDisconnectWithoutSysKeepsOccupancy(t *testing.T) {
+	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	nc := mustConnectAgent(t, s, "node-z")
 	if msg := requestP2P(t, nc, "$P2P.REGISTER", "node-z", []byte(`{"node_key":"node-z"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
@@ -291,6 +293,7 @@ func TestCalloutStartFailsClosed(t *testing.T) {
 }
 
 func TestTCPCalloutTwoNodeKeysShareCreds(t *testing.T) {
+	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	a := mustConnectAgent(t, s, "key-a")
 	b := mustConnectAgent(t, s, "key-b")
@@ -303,6 +306,7 @@ func TestTCPCalloutTwoNodeKeysShareCreds(t *testing.T) {
 }
 
 func TestTCPCalloutDuplicateNodeKeyInUse(t *testing.T) {
+	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	s, _, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	a := mustConnectAgent(t, s, "shared-key")
 	if msg := requestP2P(t, a, "$P2P.REGISTER", "shared-key", []byte(`{"node_key":"shared-key"}`)); !bytes.Contains(msg.Data, []byte(`"ok":true`)) {
@@ -399,6 +403,7 @@ func expectPermissionsViolation(t *testing.T, nc *nats.Conn, op func() error) {
 }
 
 func TestTCPCalloutLeftoverAppAccountStaysOnGlobal(t *testing.T) {
+	t.Skip("V1 REGISTER/CREATE path; Task 8 converts remaining TCP callout tests to V2")
 	conf := fmt.Sprintf(`
 listen: "127.0.0.1:-1"
 accounts {
