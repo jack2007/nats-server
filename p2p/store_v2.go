@@ -106,6 +106,7 @@ type sessionRecordV2 struct {
 	revision      uint64
 	client        string
 	server        string
+	setupTimeout  time.Duration
 	setupDeadline time.Time
 	closedAt      time.Time
 	connections   map[string]*connectionRecordV2
@@ -205,13 +206,22 @@ func (s *StoreV2) AllocateSession(sender string, cmd CreateSessionCommandV2) (Se
 		return SessionSnapshotV2{}, codeErrV2(ErrInternalErrorV2)
 	}
 	now := s.now()
+	setupTimeout := DefaultSetupTimeoutV2
+	if cmd.TotalTimeoutMs != 0 {
+		d, err := ValidateTotalTimeoutMsV2(cmd.TotalTimeoutMs)
+		if err != nil {
+			return SessionSnapshotV2{}, err
+		}
+		setupTimeout = d
+	}
 	sess := &sessionRecordV2{
 		id:            sid,
 		state:         SessionStateAllocatedV2,
 		revision:      1,
 		client:        sender,
 		server:        cmd.ServerNodeKey,
-		setupDeadline: now.Add(DefaultSetupTimeoutV2),
+		setupTimeout:  setupTimeout,
+		setupDeadline: now.Add(setupTimeout),
 		connections:   make(map[string]*connectionRecordV2),
 	}
 	sess.connections["conn-0"] = &connectionRecordV2{
@@ -681,7 +691,7 @@ func (s *StoreV2) prepareEvent(sess *sessionRecordV2, target, peer, role string,
 		Role:            role,
 		PeerNodeKey:     peer,
 		SenderNodeKey:   target,
-		SetupDeadlineMs: DefaultSetupTimeoutV2.Milliseconds(),
+		SetupDeadlineMs: sess.setupTimeout.Milliseconds(),
 		ProtocolVersion: ProtocolVersionV2,
 	}
 	return EventV2{

@@ -347,6 +347,55 @@ func TestV2Protocol_GoldenVectors(t *testing.T) {
 	}
 }
 
+func TestV2Protocol_CreateTotalTimeoutMs(t *testing.T) {
+	type tc struct {
+		name    string
+		payload string
+		valid   bool
+		wantMs  int64
+	}
+	cases := []tc{
+		{
+			name:    "omitted_means_default",
+			payload: `{"server_node_key":"` + testServerNodeV2 + `"}`,
+			valid:   true,
+			wantMs:  0,
+		},
+		{
+			name:    "explicit_timeout",
+			payload: `{"server_node_key":"` + testServerNodeV2 + `","total_timeout_ms":15000}`,
+			valid:   true,
+			wantMs:  15000,
+		},
+		{
+			name:    "zero_rejected",
+			payload: `{"server_node_key":"` + testServerNodeV2 + `","total_timeout_ms":0}`,
+			valid:   false,
+		},
+		{
+			name:    "negative_rejected",
+			payload: `{"server_node_key":"` + testServerNodeV2 + `","total_timeout_ms":-1}`,
+			valid:   false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{"version":2,"request_id":"` + testRequestIDV2 + `","payload":` + c.payload + `}`
+			dec, err := DecodeFrameV2(FrameKindCreateV2, []byte(body))
+			if c.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if dec == nil || dec.Create == nil || dec.Create.TotalTimeoutMs != c.wantMs {
+					t.Fatalf("got %+v", dec)
+				}
+				return
+			}
+			requireInvalidRequestV2(t, err)
+		})
+	}
+}
+
 func TestV2Protocol_RegisterReply(t *testing.T) {
 	type tc struct {
 		name  string

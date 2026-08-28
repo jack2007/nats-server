@@ -93,6 +93,33 @@
       }
     },
     {
+      "name": "create_ok_total_timeout_ms",
+      "kind": "SESSION.CREATE",
+      "valid": true,
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "server_node_key": "server-b",
+          "total_timeout_ms": 15000
+        }
+      }
+    },
+    {
+      "name": "create_zero_total_timeout_ms",
+      "kind": "SESSION.CREATE",
+      "valid": false,
+      "error": "invalid_request",
+      "body": {
+        "version": 2,
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "payload": {
+          "server_node_key": "server-b",
+          "total_timeout_ms": 0
+        }
+      }
+    },
+    {
       "name": "session_bind_ok",
       "kind": "SESSION.COMMAND",
       "valid": true,

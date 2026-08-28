@@ -256,9 +256,11 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 		m.replyV2Error(msg, requestIDFromData(msg.Data), protocolCodeV2(err), nil)
 		return
 	}
-	if _, err := ValidateTotalTimeoutMsV2(DefaultSetupTimeoutV2.Milliseconds()); err != nil {
-		m.replyV2Error(msg, dec.Create.RequestID, ErrInvalidRequestV2, nil)
-		return
+	if dec.Create.TotalTimeoutMs != 0 {
+		if _, err := ValidateTotalTimeoutMsV2(dec.Create.TotalTimeoutMs); err != nil {
+			m.replyV2Error(msg, dec.Create.RequestID, ErrInvalidRequestV2, nil)
+			return
+		}
 	}
 	snap, err := m.v2.store.AllocateSession(sender, *dec.Create)
 	if err != nil {

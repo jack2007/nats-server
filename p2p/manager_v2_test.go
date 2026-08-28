@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,14 @@ func createFrameV2(t *testing.T, requestID, serverNode string) []byte {
 	t.Helper()
 	return encodeFrameV2ForTest(t, requestID, "", "", map[string]any{
 		"server_node_key": serverNode,
+	})
+}
+
+func createFrameV2Timeout(t *testing.T, requestID, serverNode string, timeoutMs int64) []byte {
+	t.Helper()
+	return encodeFrameV2ForTest(t, requestID, "", "", map[string]any{
+		"server_node_key":  serverNode,
+		"total_timeout_ms": timeoutMs,
 	})
 }
 
@@ -316,6 +325,14 @@ func TestManagerV2_NonMemberSessionCommandError(t *testing.T) {
 }
 
 func TestManagerV2_QueueGroupSingleHandlerSessionCommand(t *testing.T) {
+	var hits atomic.Int32
+	v2TestOnCommand = func(suffix string) {
+		if suffix == "SESSION.CREATE" || suffix == "SESSION.COMMAND" {
+			hits.Add(1)
+		}
+	}
+	t.Cleanup(func() { v2TestOnCommand = nil })
+
 	s := startEmbedded(t)
 	cfg := Config{STUNURLs: []string{"stun:turn.example.com:3478"}}
 	for i := 0; i < 3; i++ {
@@ -332,15 +349,81 @@ func TestManagerV2_QueueGroupSingleHandlerSessionCommand(t *testing.T) {
 	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
 
 	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	hits.Store(0)
 	got := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
-	if _, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data); err != nil {
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// A second CREATE from the same client must still get exactly one reply
-	// (queue group), not three competing ALLOCATED/ERROR frames.
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("SESSION.CREATE handlers=%d want 1", n)
+	}
+
+	hits.Store(0)
 	got2 := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
 	if _, err := DecodeFrameV2(FrameKindAllocatedV2, got2.Data); err != nil {
 		t.Fatalf("second CREATE: %v body=%s", err, got2.Data)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("second SESSION.CREATE handlers=%d want 1", n)
+	}
+
+	hits.Store(0)
+	ident := IdentityV2{
+		SessionID:    alloc.Allocated.SessionID,
+		ConnectionID: alloc.Allocated.ConnectionID,
+		Epoch:        alloc.Allocated.Epoch,
+	}
+	bindSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision))
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("SESSION.COMMAND handlers=%d want 1", n)
+	}
+}
+
+func TestManagerV2_CreateTotalTimeoutMsSetupTimeout(t *testing.T) {
+	s, m := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const shortMs int64 = 50
+	got := requestV2(t, client, createSubj, createFrameV2Timeout(t, mustUUIDV2(t), mgrServerNodeV2, shortMs))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, got.Data)
+	if err != nil {
+		t.Fatalf("CREATE with total_timeout_ms: %v body=%s", err, got.Data)
+	}
+
+	expired := m.v2.store.Expire(m.now().Add(time.Duration(shortMs+1) * time.Millisecond))
+	if len(expired) == 0 {
+		t.Fatal("expected setup_timeout after CREATE total_timeout_ms, not the 10s default")
+	}
+
+	ident := IdentityV2{
+		SessionID:    alloc.Allocated.SessionID,
+		ConnectionID: alloc.Allocated.ConnectionID,
+		Epoch:        alloc.Allocated.Epoch,
+	}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision))
+	if mustErrorV2(t, reply.Data).Code != ErrSessionNotFoundV2 {
+		t.Fatalf("BIND after setup timeout: %s", reply.Data)
+	}
+
+	got2 := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	if _, err := DecodeFrameV2(FrameKindAllocatedV2, got2.Data); err != nil {
+		t.Fatal(err)
+	}
+	if ev := m.v2.store.Expire(m.now().Add(time.Duration(shortMs+1) * time.Millisecond)); len(ev) != 0 {
+		t.Fatalf("omitted total_timeout_ms must keep %s default: %+v", DefaultSetupTimeoutV2, ev)
 	}
 }
 

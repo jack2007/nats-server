@@ -151,8 +151,9 @@ type RegisterReplyV2 struct {
 }
 
 type CreateSessionCommandV2 struct {
-	RequestID     string
-	ServerNodeKey string
+	RequestID      string
+	ServerNodeKey  string
+	TotalTimeoutMs int64 // omitted means DefaultSetupTimeoutV2
 }
 
 type SessionCommandV2 struct {
@@ -512,7 +513,8 @@ func decodeCreateV2(env EnvelopeV2) (*CreateSessionCommandV2, error) {
 		return nil, err
 	}
 	var payload struct {
-		ServerNodeKey string `json:"server_node_key"`
+		ServerNodeKey  string `json:"server_node_key"`
+		TotalTimeoutMs *int64 `json:"total_timeout_ms"`
 	}
 	if err := decodeStrictV2(env.Payload, &payload); err != nil {
 		return nil, err
@@ -520,7 +522,14 @@ func decodeCreateV2(env EnvelopeV2) (*CreateSessionCommandV2, error) {
 	if err := ValidateNodeKeyV2(payload.ServerNodeKey); err != nil {
 		return nil, err
 	}
-	return &CreateSessionCommandV2{RequestID: env.RequestID, ServerNodeKey: payload.ServerNodeKey}, nil
+	cmd := &CreateSessionCommandV2{RequestID: env.RequestID, ServerNodeKey: payload.ServerNodeKey}
+	if payload.TotalTimeoutMs != nil {
+		if _, err := ValidateTotalTimeoutMsV2(*payload.TotalTimeoutMs); err != nil {
+			return nil, err
+		}
+		cmd.TotalTimeoutMs = *payload.TotalTimeoutMs
+	}
+	return cmd, nil
 }
 
 func decodeSessionCommandV2(env EnvelopeV2) (*SessionCommandV2, error) {
