@@ -86,6 +86,7 @@ type managerV2 struct {
 	applied         map[string]struct{}
 	registerSyncing int
 	joinedQueue     bool
+	externalReady   atomic.Bool
 	unreachable     bool
 	sessionMu       sync.Map
 	deliveryLocks   [v2DeliveryLockShards]sync.Mutex
@@ -189,6 +190,9 @@ func (m *Manager) startV2() error {
 	if err := m.startClusterV2(); err != nil {
 		return err
 	}
+	if err := m.startMonitorV2(); err != nil {
+		return err
+	}
 	m.v2.wg.Add(1)
 	go m.catchUpLoopV2()
 	select {
@@ -204,9 +208,6 @@ func (m *Manager) startV2() error {
 	go m.signalRetryLoopV2()
 	m.v2.wg.Add(1)
 	go m.expireLoopV2()
-	if err := m.startMonitorV2(); err != nil {
-		return err
-	}
 	return m.nc.Flush()
 }
 
@@ -214,8 +215,11 @@ func (m *Manager) stopV2() {
 	if m == nil || m.v2 == nil {
 		return
 	}
-	m.publishOwnerExitV2()
 	m.v2.catchUpCancel()
+	m.v2.mu.Lock()
+	m.v2.externalReady.Store(false)
+	m.v2.mu.Unlock()
+	m.publishOwnerExitV2()
 	select {
 	case <-m.v2.stop:
 	default:
@@ -257,7 +261,7 @@ func (m *Manager) catchUpLoopV2() {
 					return
 				}
 			}
-			err = m.joinExternalQueueV2()
+			err = m.joinExternalQueueV2(m.v2.catchUpCtx)
 			if initial {
 				close(m.v2.catchUpInitial)
 				initial = false
@@ -304,6 +308,11 @@ func (m *Manager) handleV2Command(msg *nats.Msg) {
 	}
 	if strings.HasPrefix(suffix, "REGISTER.") {
 		m.handleRegisterV2(msg, sender, suffix)
+		return
+	}
+	if !m.v2.externalReady.Load() {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrBusyV2, &ms)
 		return
 	}
 	if m.v2ExternalBlocked(sender) {
@@ -1542,6 +1551,7 @@ func (m *Manager) dropQueueGroupV2() error {
 	if m == nil || m.v2 == nil {
 		return nil
 	}
+	m.v2.externalReady.Store(false)
 	for _, sub := range m.v2.cmdSubs {
 		_ = sub.Unsubscribe()
 	}

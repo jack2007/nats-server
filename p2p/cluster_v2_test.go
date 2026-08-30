@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -1029,6 +1030,69 @@ func TestClusterV2_CatchUpRetriesUntilComplete(t *testing.T) {
 	}
 	if got := len(mB.v2.cmdSubs); got != 5 {
 		t.Fatalf("concurrent catch-up wake created %d queue subscriptions, want 5", got)
+	}
+}
+
+func TestClusterV2_CatchUpRejectsUnknownAndEmptySnapshotSenders(t *testing.T) {
+	alive := map[string]struct{}{"peer-a": {}, "peer-c": {}}
+	for _, sender := range []string{"", "ghost"} {
+		if catchUpSenderExpectedV2(alive, sender) {
+			t.Fatalf("unexpected snapshot sender %q counted toward catch-up", sender)
+		}
+	}
+	for _, sender := range []string{"peer-a", "peer-c"} {
+		if !catchUpSenderExpectedV2(alive, sender) {
+			t.Fatalf("alive snapshot sender %q rejected", sender)
+		}
+	}
+	if !catchUpSenderExpectedV2(nil, "new-peer") {
+		t.Fatal("discovering catch-up must accept a non-empty peer when alive set is empty")
+	}
+}
+
+func TestClusterV2_CatchUpCancellationIsNotSuccess(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.catchUpV2(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled catch-up returned %v, want context.Canceled", err)
+	}
+}
+
+func TestClusterV2_PartialQueueJoinDoesNotAdmitCommands(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	client := registerOnServerV2(t, s, mgrClientNodeV2, newRegistrationIDV2(t))
+	_ = registerOnServerV2(t, s, mgrServerNodeV2, newRegistrationIDV2(t))
+	if err := m.dropQueueGroupV2(); err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := m.nc.QueueSubscribe("$P2P.V2.CMD.*.SESSION.CREATE", v2CoordinatorQueue, m.handleV2Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	if err := m.nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := requestV2Wait(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2), time.Second)
+	if perr := mustErrorV2(t, reply.Data); perr.Code != ErrBusyV2 {
+		t.Fatalf("partial queue join admitted CREATE: %+v body=%s", perr, reply.Data)
 	}
 }
 

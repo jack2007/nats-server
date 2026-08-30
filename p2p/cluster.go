@@ -652,17 +652,32 @@ func (m *Manager) startClusterV2() error {
 	return nc.Flush()
 }
 
-func (m *Manager) catchUpPeerCountV2() int {
+func (m *Manager) catchUpPeersV2() map[string]struct{} {
+	peers := make(map[string]struct{})
 	if m.peers == nil {
-		return 0
+		return peers
 	}
-	n := 0
 	for _, id := range m.peers.alive(m.now()) {
 		if id != m.serverID {
-			n++
+			peers[id] = struct{}{}
 		}
 	}
-	return n
+	return peers
+}
+
+func (m *Manager) catchUpPeerCountV2() int {
+	return len(m.catchUpPeersV2())
+}
+
+func catchUpSenderExpectedV2(peers map[string]struct{}, sender string) bool {
+	if sender == "" {
+		return false
+	}
+	if len(peers) == 0 {
+		return true
+	}
+	_, ok := peers[sender]
+	return ok
 }
 
 func (m *Manager) applySnapshotReplyV2(snap v2SnapshotReply) {
@@ -675,6 +690,9 @@ func (m *Manager) applySnapshotReplyV2(snap v2SnapshotReply) {
 }
 
 func (m *Manager) catchUpV2(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if v2TestBeforeCatchUp != nil {
 		v2TestBeforeCatchUp(m)
 	}
@@ -692,6 +710,7 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 	if err := nc.PublishRequest(subjectV2MgrSnapshot, inbox, []byte(m.serverID)); err != nil {
 		return err
 	}
+	expected := m.catchUpPeersV2()
 	discover := m.v2.catchUpTimeout
 	if extra == 0 && !m.inCluster() {
 		discover = min(discover, 50*time.Millisecond)
@@ -711,19 +730,22 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 		msg, err := sub.NextMsgWithContext(waitCtx)
 		cancel()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			break
 		}
 		var snap v2SnapshotReply
 		if json.Unmarshal(msg.Data, &snap) != nil {
 			continue
 		}
-		if snap.Sender == m.serverID {
+		if snap.Sender == m.serverID || !catchUpSenderExpectedV2(expected, snap.Sender) {
 			continue
 		}
 		m.applySnapshotReplyV2(snap)
 		seen[snap.Sender] = struct{}{}
 		peerSnap = true
-		need := m.catchUpPeerCountV2()
+		need := len(expected)
 		if need < 1 {
 			need = 1
 		}
@@ -732,7 +754,10 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 			return nil
 		}
 	}
-	others := m.catchUpPeerCountV2()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	others := len(expected)
 	if extra == 0 && others == 0 && !peerSnap {
 		return nil
 	}
@@ -749,7 +774,10 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 
 var errV2CatchUpIncomplete = errors.New("v2 catch-up incomplete")
 
-func (m *Manager) joinExternalQueueV2() error {
+func (m *Manager) joinExternalQueueV2(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.v2.mu.Lock()
 	if m.v2.joinedQueue {
 		m.v2.mu.Unlock()
@@ -757,6 +785,12 @@ func (m *Manager) joinExternalQueueV2() error {
 	}
 	m.v2.mu.Unlock()
 	var joined []*nats.Subscription
+	rollback := func() {
+		for _, sub := range joined {
+			_ = sub.Unsubscribe()
+		}
+		_ = m.nc.Flush()
+	}
 	for _, suffix := range []string{
 		"SESSION.CREATE",
 		"SESSION.COMMAND",
@@ -766,23 +800,25 @@ func (m *Manager) joinExternalQueueV2() error {
 	} {
 		sub, err := m.nc.QueueSubscribe("$P2P.V2.CMD.*."+suffix, v2CoordinatorQueue, m.handleV2Command)
 		if err != nil {
-			for _, joinedSub := range joined {
-				_ = joinedSub.Unsubscribe()
-			}
+			rollback()
 			return err
 		}
 		joined = append(joined, sub)
 	}
 	if err := m.nc.Flush(); err != nil {
-		for _, sub := range joined {
-			_ = sub.Unsubscribe()
-		}
+		rollback()
 		return err
 	}
 	m.v2.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		m.v2.mu.Unlock()
+		rollback()
+		return err
+	}
 	m.v2.cmdSubs = append(m.v2.cmdSubs, joined...)
 	m.v2.subs = append(m.v2.subs, joined...)
 	m.v2.joinedQueue = true
+	m.v2.externalReady.Store(true)
 	m.v2.mu.Unlock()
 	return nil
 }

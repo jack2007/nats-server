@@ -337,18 +337,42 @@ func TestManagerV2_QueueGroupSingleHandlerSessionCommand(t *testing.T) {
 
 	s := startEmbedded(t)
 	cfg := Config{STUNURLs: []string{"stun:turn.example.com:3478"}}
+	var managers []*Manager
 	for i := 0; i < 3; i++ {
 		m, err := StartManager(s, cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(m.Stop)
+		managers = append(managers, m)
 	}
 
 	client := agentConn(t, s, mgrClientNodeV2)
 	srv := agentConn(t, s, mgrServerNodeV2)
 	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
 	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	deadline := time.Now().Add(time.Second)
+	for {
+		ready := true
+		for _, m := range managers {
+			m.v2.mu.Lock()
+			clientNode := m.v2.nodes[mgrClientNodeV2]
+			serverNode := m.v2.nodes[mgrServerNodeV2]
+			ready = ready && clientNode != nil && !clientNode.pending &&
+				serverNode != nil && !serverNode.pending
+			m.v2.mu.Unlock()
+			if !ready {
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("registrations did not reach every queue-group manager")
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
 	hits.Store(0)
