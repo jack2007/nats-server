@@ -121,15 +121,17 @@ type sessionRecordV2 struct {
 }
 
 type requestRecordV2 struct {
-	node      NodeSnapshotV2
-	session   SessionSnapshotV2
-	conn      ConnectionSnapshotV2
-	events    []EventV2
-	sessionID string
-	hasNode   bool
-	hasSess   bool
-	hasConn   bool
-	hasEv     bool
+	node        NodeSnapshotV2
+	session     SessionSnapshotV2
+	conn        ConnectionSnapshotV2
+	events      []EventV2
+	pending     []EventV2
+	sessionID   string
+	deliverySeq uint64
+	hasNode     bool
+	hasSess     bool
+	hasConn     bool
+	hasEv       bool
 }
 
 func NewStoreV2(now func() time.Time, maxConnectionsPerSession int) *StoreV2 {
@@ -287,17 +289,17 @@ func (s *StoreV2) BindSession(sender string, cmd SessionCommandV2) ([]EventV2, e
 		conn.state = ConnectionStatePreparingV2
 		events := s.makePrepareEvents(sess, conn)
 		conn.bindEvents = events
-		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
+		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), pending: cloneEventsV2(events), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 		return events, nil
 	case SessionCommandCloseV2:
 		events := s.closeSessionLocked(sess)
-		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
+		s.requests[key] = requestRecordV2{events: cloneEventsV2(events), pending: cloneEventsV2(events), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 		return events, nil
 	case SessionCommandResumeV2:
 		if sess.state == SessionStateClosedV2 {
 			return nil, codeErrV2(ErrInvalidStateV2)
 		}
-		s.requests[key] = requestRecordV2{sessionID: sess.id, hasEv: true}
+		s.requests[key] = requestRecordV2{sessionID: sess.id, deliverySeq: 1, hasEv: true}
 		return nil, nil
 	default:
 		return nil, invalidRequestV2()
@@ -335,7 +337,7 @@ func (s *StoreV2) MarkConnectionReady(sender string, cmd ConnectionCommandV2) ([
 		events = s.makeStartEvents(sess, conn)
 		conn.readyEvents = events
 	}
-	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
+	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), pending: cloneEventsV2(events), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 	return events, nil
 }
 
@@ -467,7 +469,7 @@ func (s *StoreV2) BindConnection(sender string, cmd ConnectionCommandV2) ([]Even
 	conn.state = ConnectionStatePreparingV2
 	events := s.makePrepareEvents(sess, conn)
 	conn.bindEvents = events
-	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
+	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), pending: cloneEventsV2(events), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 	return events, nil
 }
 
@@ -489,7 +491,7 @@ func (s *StoreV2) CloseConnection(sender string, cmd ConnectionCommandV2) ([]Eve
 		return nil, err
 	}
 	if conn.state == ConnectionStateClosedV2 {
-		s.requests[key] = requestRecordV2{events: cloneEventsV2(conn.closeEvents), sessionID: sess.id, hasEv: true}
+		s.requests[key] = requestRecordV2{events: cloneEventsV2(conn.closeEvents), pending: cloneEventsV2(conn.closeEvents), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 		return cloneEventsV2(conn.closeEvents), nil
 	}
 	sess.revision++
@@ -497,7 +499,7 @@ func (s *StoreV2) CloseConnection(sender string, cmd ConnectionCommandV2) ([]Eve
 	s.dropGenerationLocked(sess.id, conn.id, conn.epoch)
 	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
 	conn.closeEvents = events
-	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), sessionID: sess.id, hasEv: true}
+	s.requests[key] = requestRecordV2{events: cloneEventsV2(events), pending: cloneEventsV2(events), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 	return events, nil
 }
 
@@ -526,8 +528,126 @@ func (s *StoreV2) RejectConnection(sender string, cmd ConnectionCommandV2) ([]Ev
 	s.dropGenerationLocked(sess.id, conn.id, conn.epoch)
 	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
 	conn.closeEvents = events
-	s.requests[key] = requestRecordV2{sessionID: sess.id, hasEv: true}
+	s.requests[key] = requestRecordV2{pending: cloneEventsV2(events), sessionID: sess.id, deliverySeq: 1, hasEv: true}
 	return events, nil
+}
+
+// PendingEvents returns the unconfirmed event deliveries for a cached request.
+func (s *StoreV2) PendingEvents(sender, requestID string) []EventV2 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.requests[RequestKeyV2{SenderNodeKey: sender, RequestID: requestID}]
+	if !ok || !rec.hasEv {
+		return nil
+	}
+	return cloneEventsV2(rec.pending)
+}
+
+// MarkEventsPublished confirms only the supplied message IDs and leaves every
+// other delivery pending for a retry of the same request.
+func (s *StoreV2) MarkEventsPublished(sender, requestID string, messageIDs []string) error {
+	if err := ValidateNodeKeyV2(sender); err != nil {
+		return err
+	}
+	if err := ValidateUUIDV2(requestID); err != nil {
+		return err
+	}
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	confirmed := make(map[string]struct{}, len(messageIDs))
+	for _, id := range messageIDs {
+		if err := ValidateUUIDV2(id); err != nil {
+			return err
+		}
+		confirmed[id] = struct{}{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := RequestKeyV2{SenderNodeKey: sender, RequestID: requestID}
+	rec, ok := s.requests[key]
+	if !ok || !rec.hasEv || len(rec.pending) == 0 {
+		return nil
+	}
+	pending := rec.pending[:0]
+	changed := false
+	for _, event := range rec.pending {
+		if _, ok := confirmed[event.MessageID]; ok {
+			changed = true
+			continue
+		}
+		pending = append(pending, event)
+	}
+	if changed {
+		rec.pending = cloneEventsV2(pending)
+		rec.deliverySeq++
+		s.requests[key] = rec
+	}
+	return nil
+}
+
+func (s *StoreV2) requestSnapshotsV2(sessionID string) []v2RequestSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	requests := make([]v2RequestSnapshot, 0)
+	for key, rec := range s.requests {
+		if rec.sessionID != sessionID {
+			continue
+		}
+		requests = append(requests, v2RequestSnapshot{
+			SenderNodeKey: key.SenderNodeKey,
+			RequestID:     key.RequestID,
+			SessionID:     rec.sessionID,
+			Node:          rec.node,
+			Session:       rec.session,
+			Connection:    rec.conn,
+			Events:        cloneEventsV2(rec.events),
+			Pending:       cloneEventsV2(rec.pending),
+			DeliverySeq:   rec.deliverySeq,
+			HasNode:       rec.hasNode,
+			HasSession:    rec.hasSess,
+			HasConnection: rec.hasConn,
+			HasEvents:     rec.hasEv,
+		})
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		if requests[i].SenderNodeKey != requests[j].SenderNodeKey {
+			return requests[i].SenderNodeKey < requests[j].SenderNodeKey
+		}
+		return requests[i].RequestID < requests[j].RequestID
+	})
+	return requests
+}
+
+func (s *StoreV2) importRequestSnapshotsV2(requests []v2RequestSnapshot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.importRequestSnapshotsLockedV2(requests)
+}
+
+func (s *StoreV2) importRequestSnapshotsLockedV2(requests []v2RequestSnapshot) {
+	for _, snapshot := range requests {
+		if snapshot.SenderNodeKey == "" || snapshot.RequestID == "" {
+			continue
+		}
+		key := RequestKeyV2{SenderNodeKey: snapshot.SenderNodeKey, RequestID: snapshot.RequestID}
+		if current, ok := s.requests[key]; ok && current.deliverySeq >= snapshot.DeliverySeq {
+			continue
+		}
+		s.requests[key] = requestRecordV2{
+			node:        snapshot.Node,
+			session:     snapshot.Session,
+			conn:        snapshot.Connection,
+			events:      cloneEventsV2(snapshot.Events),
+			pending:     cloneEventsV2(snapshot.Pending),
+			sessionID:   snapshot.SessionID,
+			deliverySeq: snapshot.DeliverySeq,
+			hasNode:     snapshot.HasNode,
+			hasSess:     snapshot.HasSession,
+			hasConn:     snapshot.HasConnection,
+			hasEv:       snapshot.HasEvents,
+		}
+	}
 }
 
 func (s *StoreV2) ExpirePendingSignals(now time.Time) []EventV2 {

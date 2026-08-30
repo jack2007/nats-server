@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -947,6 +948,230 @@ func TestManagerV2_ConnectionReject(t *testing.T) {
 	repeat := requestV2(t, client, connSubj, frame)
 	if !bytesContainsOK(repeat.Data) {
 		t.Fatalf("duplicate REJECT reply must be OK: %s", repeat.Data)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+}
+
+func TestManagerV2_StatePublishRetry(t *testing.T) {
+	for _, command := range []string{"session_bind", "ready_start", "session_close", "connection_close", "connection_reject"} {
+		t.Run(command, func(t *testing.T) {
+			s, mgr := startManagerV2(t, Config{})
+			client := agentConn(t, s, mgrClientNodeV2)
+			srv := agentConn(t, s, mgrServerNodeV2)
+			clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+			serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+			mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+			mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+			createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+			created := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+			alloc, err := DecodeFrameV2(FrameKindAllocatedV2, created.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+			sender := client
+			senderNode := mgrClientNodeV2
+			var subject string
+			var frame []byte
+			var eventKind FrameKindV2
+			reqID := mustUUIDV2(t)
+			switch command {
+			case "session_bind":
+				subject, _ = CommandSubjectV2(senderNode, "SESSION.COMMAND")
+				frame = sessionCmdFrameV2(t, reqID, SessionCommandBindV2, ident, alloc.Allocated.Revision)
+				eventKind = FrameKindPrepareV2
+			case "ready_start":
+				bindSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+				_ = requestV2(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision))
+				cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+				sPrep := nextEventV2(t, serverEv, FrameKindPrepareV2)
+				readySubj, _ := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+				_ = requestV2(t, client, readySubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, cPrep.Prepare.Revision))
+				sender = srv
+				senderNode = mgrServerNodeV2
+				subject, _ = CommandSubjectV2(senderNode, "CONNECTION.COMMAND")
+				frame = connCmdFrameV2(t, reqID, ConnectionCommandReadyV2, ident, sPrep.Prepare.Revision)
+				eventKind = FrameKindStartV2
+			case "session_close":
+				subject, _ = CommandSubjectV2(senderNode, "SESSION.COMMAND")
+				frame = sessionCmdFrameV2(t, reqID, SessionCommandCloseV2, ident, alloc.Allocated.Revision)
+				eventKind = FrameKindCloseV2
+			case "connection_close":
+				subject, _ = CommandSubjectV2(senderNode, "CONNECTION.COMMAND")
+				frame = connCmdFrameV2(t, reqID, ConnectionCommandCloseV2, ident, alloc.Allocated.Revision)
+				eventKind = FrameKindCloseV2
+			case "connection_reject":
+				subject, _ = CommandSubjectV2(senderNode, "CONNECTION.COMMAND")
+				frame = connCmdFrameV2(t, reqID, ConnectionCommandRejectV2, ident, alloc.Allocated.Revision)
+				eventKind = FrameKindCloseV2
+			}
+
+			var hookMu sync.Mutex
+			var attempts []string
+			v2TestPublishHook = func(_ string, data []byte) error {
+				var env EnvelopeV2
+				if err := json.Unmarshal(data, &env); err != nil {
+					return err
+				}
+				hookMu.Lock()
+				defer hookMu.Unlock()
+				attempts = append(attempts, env.MessageID)
+				if len(attempts) == 2 {
+					return errors.New("injected second publish failure")
+				}
+				return nil
+			}
+			t.Cleanup(func() { v2TestPublishHook = nil })
+
+			first := requestV2(t, sender, subject, frame)
+			if perr := mustErrorV2(t, first.Data); perr.Code != ErrBusyV2 || perr.RetryAfterMs == nil {
+				t.Fatalf("first attempt want busy+retry, got %+v body=%s", perr, first.Data)
+			}
+			firstEvent := nextEventV2(t, clientEv, eventKind)
+			if pending := mgr.v2.store.PendingEvents(senderNode, reqID); len(pending) != 1 {
+				t.Fatalf("partial publish pending=%+v want one delivery", pending)
+			}
+
+			second := requestV2(t, sender, subject, frame)
+			if !bytesContainsOK(second.Data) {
+				t.Fatalf("retry reply not OK: %s", second.Data)
+			}
+			secondEvent := nextEventV2(t, serverEv, eventKind)
+			hookMu.Lock()
+			gotAttempts := append([]string(nil), attempts...)
+			hookMu.Unlock()
+			if len(gotAttempts) != 3 || gotAttempts[0] != firstEvent.Envelope.MessageID || gotAttempts[1] != gotAttempts[2] || gotAttempts[2] != secondEvent.Envelope.MessageID {
+				t.Fatalf("publish attempts/message IDs=%v first=%s second=%s", gotAttempts, firstEvent.Envelope.MessageID, secondEvent.Envelope.MessageID)
+			}
+			if pending := mgr.v2.store.PendingEvents(senderNode, reqID); len(pending) != 0 {
+				t.Fatalf("successful retry retained pending deliveries: %+v", pending)
+			}
+
+			third := requestV2(t, sender, subject, frame)
+			if !bytesContainsOK(third.Data) {
+				t.Fatalf("third reply not cached OK: %s", third.Data)
+			}
+			hookMu.Lock()
+			gotAttemptCount := len(attempts)
+			hookMu.Unlock()
+			if gotAttemptCount != 3 {
+				t.Fatalf("third request republished events: attempts=%v", attempts)
+			}
+			assertNoEventV2(t, clientEv)
+			assertNoEventV2(t, serverEv)
+		})
+	}
+}
+
+func TestManagerV2_BindReplyLossDoesNotRepublish(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	created := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, created.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+	reqID := mustUUIDV2(t)
+	subject, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	frame := sessionCmdFrameV2(t, reqID, SessionCommandBindV2, ident, alloc.Allocated.Revision)
+	if err := client.Publish(subject, frame); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	_ = nextEventV2(t, clientEv, FrameKindPrepareV2)
+	_ = nextEventV2(t, serverEv, FrameKindPrepareV2)
+
+	retry := requestV2(t, client, subject, frame)
+	if !bytesContainsOK(retry.Data) {
+		t.Fatalf("retry after lost reply not OK: %s", retry.Data)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+}
+
+func TestManagerV2_ConcurrentPublishRetrySerializesDelivery(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	created := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, created.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+	reqID := mustUUIDV2(t)
+	subject, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	frame := sessionCmdFrameV2(t, reqID, SessionCommandBindV2, ident, alloc.Allocated.Revision)
+
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var attempts atomic.Int32
+	v2TestPublishHook = func(_ string, _ []byte) error {
+		attempts.Add(1)
+		entered <- struct{}{}
+		<-release
+		return nil
+	}
+	t.Cleanup(func() { v2TestPublishHook = nil })
+
+	request := func(done chan<- *nats.Msg) {
+		got, err := client.Request(subject, frame, 2*time.Second)
+		if err != nil {
+			done <- &nats.Msg{Data: []byte(err.Error())}
+			return
+		}
+		done <- got
+	}
+	firstDone := make(chan *nats.Msg, 1)
+	secondDone := make(chan *nats.Msg, 1)
+	go request(firstDone)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("first request never entered publish")
+	}
+	go request(secondDone)
+	concurrentPublish := false
+	select {
+	case <-entered:
+		concurrentPublish = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if concurrentPublish {
+		t.Fatal("same request published concurrently")
+	}
+	for i, done := range []<-chan *nats.Msg{firstDone, secondDone} {
+		select {
+		case reply := <-done:
+			if !bytesContainsOK(reply.Data) {
+				t.Fatalf("request %d reply not OK: %s", i+1, reply.Data)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("request %d did not complete", i+1)
+		}
+	}
+	_ = nextEventV2(t, clientEv, FrameKindPrepareV2)
+	_ = nextEventV2(t, serverEv, FrameKindPrepareV2)
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("publish attempts=%d want one delivery per target", got)
 	}
 	assertNoEventV2(t, clientEv)
 	assertNoEventV2(t, serverEv)

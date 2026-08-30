@@ -1,8 +1,10 @@
 package p2p
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -513,6 +515,7 @@ const (
 	v2CatchUpDiscoverTimeout = time.Second
 	v2MutationRegister       = "register"
 	v2MutationSession        = "session"
+	v2MutationDelivery       = "delivery"
 	v2MutationOwnerLost      = "owner_lost"
 	v2MutationLeave          = "leave"
 )
@@ -560,6 +563,23 @@ type v2MgrMutation struct {
 	Epoch             uint64                 `json:"epoch,omitempty"`
 	SetupTimeoutMs    int64                  `json:"setup_timeout_ms,omitempty"`
 	Pending           bool                   `json:"pending,omitempty"`
+	Requests          []v2RequestSnapshot    `json:"requests,omitempty"`
+}
+
+type v2RequestSnapshot struct {
+	SenderNodeKey string               `json:"sender_node_key"`
+	RequestID     string               `json:"request_id"`
+	SessionID     string               `json:"session_id"`
+	Node          NodeSnapshotV2       `json:"node"`
+	Session       SessionSnapshotV2    `json:"session"`
+	Connection    ConnectionSnapshotV2 `json:"connection"`
+	Events        []EventV2            `json:"events,omitempty"`
+	Pending       []EventV2            `json:"pending,omitempty"`
+	DeliverySeq   uint64               `json:"delivery_seq"`
+	HasNode       bool                 `json:"has_node"`
+	HasSession    bool                 `json:"has_session"`
+	HasConnection bool                 `json:"has_connection"`
+	HasEvents     bool                 `json:"has_events"`
 }
 
 type v2ConnectionSnapshot struct {
@@ -959,11 +979,23 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 		})
 	}
 	m.v2.mu.Unlock()
+	for i := range sessions {
+		sessions[i].Requests = m.v2.store.requestSnapshotsV2(sessions[i].SessionID)
+		id := snapshotSessionMutationIDV2(sessions[i].Sender, sessions[i].SessionID, sessions[i].Revision, sessions[i].Requests)
+		sessions[i].MutationID = id
+		sessions[i].MessageID = id
+	}
 	body, err := json.Marshal(v2SnapshotReply{Sender: m.serverID, Nodes: nodes, Sessions: sessions})
 	if err != nil || msg.Reply == "" {
 		return
 	}
 	_ = msg.Respond(body)
+}
+
+func snapshotSessionMutationIDV2(sender, sessionID string, revision uint64, requests []v2RequestSnapshot) string {
+	raw, _ := json.Marshal(requests)
+	digest := sha256.Sum256(raw)
+	return fmt.Sprintf("snap-sess-%s-%s-%d-%x", sender, sessionID, revision, digest[:8])
 }
 
 func (m *Manager) handleV2MgrCommand(msg *nats.Msg) {
@@ -1077,6 +1109,17 @@ func (m *Manager) applyMutationV2(mut v2MgrMutation) bool {
 		if mut.RequestID != "" && mut.ClientNodeKey != "" {
 			m.v2.requests[RequestKeyV2{SenderNodeKey: mut.ClientNodeKey, RequestID: mut.RequestID}] = mut.SessionID
 		}
+		m.v2.applied[mut.MutationID] = struct{}{}
+		m.v2.mu.Unlock()
+		return true
+	case v2MutationDelivery:
+		if meta, ok := m.v2.owners[mut.SessionID]; ok && meta.Owner != "" && mut.Owner != "" && meta.Owner != mut.Owner {
+			m.v2.mu.Unlock()
+			return false
+		}
+		m.v2.mu.Unlock()
+		m.v2.store.importRequestSnapshotsV2(mut.Requests)
+		m.v2.mu.Lock()
 		m.v2.applied[mut.MutationID] = struct{}{}
 		m.v2.mu.Unlock()
 		return true
@@ -1217,6 +1260,7 @@ func (m *Manager) syncSessionLockedV2(sessionID, requestID, sender string) error
 }
 
 func (m *Manager) syncSessionConnectionsV2(snap SessionSnapshotV2, connections []ConnectionSnapshotV2, requestID, sender string) error {
+	requests := m.v2.store.requestSnapshotsV2(snap.SessionID)
 	m.v2.mu.Lock()
 	meta := m.v2.owners[snap.SessionID]
 	if meta == nil {
@@ -1251,9 +1295,27 @@ func (m *Manager) syncSessionConnectionsV2(snap SessionSnapshotV2, connections [
 		Connections:     cloneV2ConnectionSnapshots(meta.Connections),
 		Epoch:           meta.Epoch,
 		SetupTimeoutMs:  meta.SetupTimeoutMs,
+		Requests:        requests,
 	}
 	m.v2.mu.Unlock()
 	return m.syncMutationV2(mut)
+}
+
+func (m *Manager) syncRequestDeliveriesV2(sessionID string) error {
+	requests := m.v2.store.requestSnapshotsV2(sessionID)
+	m.v2.mu.Lock()
+	meta := m.v2.owners[sessionID]
+	owner := m.serverID
+	if meta != nil && meta.Owner != "" {
+		owner = meta.Owner
+	}
+	m.v2.mu.Unlock()
+	return m.syncMutationV2(v2MgrMutation{
+		Kind:      v2MutationDelivery,
+		SessionID: sessionID,
+		Owner:     owner,
+		Requests:  requests,
+	})
 }
 
 func v2ConnectionSnapshotsFromStore(connections []ConnectionSnapshotV2) []v2ConnectionSnapshot {
@@ -1295,6 +1357,7 @@ func mutationConnectionsV2(mut v2MgrMutation) []v2ConnectionSnapshot {
 func (s *StoreV2) importSessionReplicaV2(mut v2MgrMutation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.importRequestSnapshotsLockedV2(mut.Requests)
 	sess, ok := s.sessions[mut.SessionID]
 	if !ok {
 		if mut.SessionID == "" {

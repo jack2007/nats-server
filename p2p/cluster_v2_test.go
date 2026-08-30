@@ -1122,6 +1122,129 @@ func TestClusterV2_InternalMutationOwnerRevisionGuard(t *testing.T) {
 	}
 }
 
+func TestClusterV2_DeliveryLedgerSnapshotDoesNotRevivePublished(t *testing.T) {
+	owner, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, owner, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, owner, storeServerNodeV2, storeServerRegV2)
+	session := mustAllocateSessionV2(t, owner, storeClientNodeV2)
+	cmd := sessionBindCmdV2(t, session)
+	events, err := owner.BindSession(storeClientNodeV2, cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replica := NewStoreV2(nil, storeMaxConnsV2)
+	mgr := &Manager{serverID: "replica", v2: &managerV2{
+		store:    replica,
+		owners:   make(map[string]*v2SessionMeta),
+		requests: make(map[RequestKeyV2]string),
+		applied:  make(map[string]struct{}),
+	}}
+	initial := v2MgrMutation{
+		MutationID:      mustUUIDV2(t),
+		MessageID:       mustUUIDV2(t),
+		Kind:            v2MutationSession,
+		SessionID:       session.SessionID,
+		Owner:           "owner",
+		Revision:        events[0].Revision,
+		Sender:          "owner",
+		ClientNodeKey:   storeClientNodeV2,
+		ServerNodeKey:   storeServerNodeV2,
+		State:           string(SessionStatePreparingV2),
+		ConnectionID:    session.ConnectionID,
+		ConnectionState: string(ConnectionStatePreparingV2),
+		Connections: []v2ConnectionSnapshot{{
+			ConnectionID: session.ConnectionID,
+			Epoch:        session.Epoch,
+			State:        string(ConnectionStatePreparingV2),
+		}},
+		Requests: owner.requestSnapshotsV2(session.SessionID),
+	}
+	if !mgr.applyMutationV2(initial) {
+		t.Fatal("late-join session snapshot rejected")
+	}
+	if pending := replica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 2 {
+		t.Fatalf("late join pending=%+v want two", pending)
+	}
+
+	if err := owner.MarkEventsPublished(storeClientNodeV2, cmd.RequestID, []string{events[0].MessageID}); err != nil {
+		t.Fatal(err)
+	}
+	confirmed := v2MgrMutation{
+		MutationID: mustUUIDV2(t),
+		MessageID:  mustUUIDV2(t),
+		Kind:       v2MutationDelivery,
+		SessionID:  session.SessionID,
+		Owner:      "owner",
+		Sender:     "owner",
+		Requests:   owner.requestSnapshotsV2(session.SessionID),
+	}
+	if !mgr.applyMutationV2(confirmed) {
+		t.Fatal("delivery confirmation mutation rejected")
+	}
+	if pending := replica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 1 || pending[0].MessageID != events[1].MessageID {
+		t.Fatalf("replica partial confirmation pending=%+v", pending)
+	}
+
+	stale := initial
+	stale.MutationID = mustUUIDV2(t)
+	stale.MessageID = mustUUIDV2(t)
+	if !mgr.applyMutationV2(stale) {
+		t.Fatal("stale peer snapshot should be harmless")
+	}
+	if pending := replica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 1 || pending[0].MessageID != events[1].MessageID {
+		t.Fatalf("stale snapshot revived confirmed delivery: %+v", pending)
+	}
+
+	if err := owner.MarkEventsPublished(storeClientNodeV2, cmd.RequestID, []string{events[1].MessageID}); err != nil {
+		t.Fatal(err)
+	}
+	confirmed.MutationID = mustUUIDV2(t)
+	confirmed.MessageID = mustUUIDV2(t)
+	confirmed.Requests = owner.requestSnapshotsV2(session.SessionID)
+	if !mgr.applyMutationV2(confirmed) {
+		t.Fatal("final delivery confirmation mutation rejected")
+	}
+	if pending := replica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 0 {
+		t.Fatalf("replica retained fully confirmed delivery: %+v", pending)
+	}
+
+	stale.MutationID = mustUUIDV2(t)
+	stale.MessageID = mustUUIDV2(t)
+	if !mgr.applyMutationV2(stale) {
+		t.Fatal("second stale peer snapshot should be harmless")
+	}
+	if pending := replica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 0 {
+		t.Fatalf("fully confirmed delivery revived after stale snapshot: %+v", pending)
+	}
+
+	lateReplica := NewStoreV2(nil, storeMaxConnsV2)
+	lateMgr := &Manager{serverID: "late-replica", v2: &managerV2{
+		store:    lateReplica,
+		owners:   make(map[string]*v2SessionMeta),
+		requests: make(map[RequestKeyV2]string),
+		applied:  make(map[string]struct{}),
+	}}
+	peerStale := initial
+	peerStale.Sender = "stale-peer"
+	peerStale.MutationID = snapshotSessionMutationIDV2(peerStale.Sender, peerStale.SessionID, peerStale.Revision, peerStale.Requests)
+	peerStale.MessageID = peerStale.MutationID
+	if !lateMgr.applyMutationV2(peerStale) {
+		t.Fatal("late replica rejected stale peer snapshot")
+	}
+	peerCurrent := initial
+	peerCurrent.Sender = "current-peer"
+	peerCurrent.Requests = owner.requestSnapshotsV2(session.SessionID)
+	peerCurrent.MutationID = snapshotSessionMutationIDV2(peerCurrent.Sender, peerCurrent.SessionID, peerCurrent.Revision, peerCurrent.Requests)
+	peerCurrent.MessageID = peerCurrent.MutationID
+	if !lateMgr.applyMutationV2(peerCurrent) {
+		t.Fatal("late replica rejected current peer snapshot")
+	}
+	if pending := lateReplica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 0 {
+		t.Fatalf("late join kept stale peer deliveries after current snapshot: %+v", pending)
+	}
+}
+
 func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {
 	sA, sB, sC := startClusterTriple(t)
 	cfg := clusterConfig()
@@ -1159,7 +1282,8 @@ func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bind := requestV2Wait(t, client, bindSubj, sessionCmdFrameV2(t, mustUUIDV2(t), SessionCommandBindV2, ident, alloc.Allocated.Revision), 5*time.Second)
+	bindReq := mustUUIDV2(t)
+	bind := requestV2Wait(t, client, bindSubj, sessionCmdFrameV2(t, bindReq, SessionCommandBindV2, ident, alloc.Allocated.Revision), 5*time.Second)
 	if !bytesContainsOK(bind.Data) {
 		t.Fatalf("BIND: %s", bind.Data)
 	}
@@ -1186,6 +1310,12 @@ func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {
 	}
 	if !joined {
 		t.Fatal("B never joined after peer snapshot catch-up")
+	}
+	mB.v2.store.mu.Lock()
+	bindRecord, haveBindRecord := mB.v2.store.requests[RequestKeyV2{SenderNodeKey: mgrClientNodeV2, RequestID: bindReq}]
+	mB.v2.store.mu.Unlock()
+	if !haveBindRecord || !bindRecord.hasEv || len(bindRecord.events) != 2 || len(bindRecord.pending) != 0 {
+		t.Fatalf("late join BIND ledger missing or revived: found=%v record=%+v", haveBindRecord, bindRecord)
 	}
 
 	mA.dropQueueGroupV2()

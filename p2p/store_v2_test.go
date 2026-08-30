@@ -288,6 +288,59 @@ func TestStoreV2_StateCommandsIdempotentByRequestID(t *testing.T) {
 	}
 }
 
+func TestStoreV2_StateCommandsIdempotentDeliveryLedger(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	snap := mustAllocateSessionV2(t, s, storeClientNodeV2)
+	cmd := sessionBindCmdV2(t, snap)
+
+	events, err := s.BindSession(storeClientNodeV2, cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("BIND events=%d want 2", len(events))
+	}
+	pending := s.PendingEvents(storeClientNodeV2, cmd.RequestID)
+	if len(pending) != 2 {
+		t.Fatalf("initial pending=%d want 2", len(pending))
+	}
+
+	if err := s.MarkEventsPublished(storeClientNodeV2, cmd.RequestID, []string{events[0].MessageID}); err != nil {
+		t.Fatal(err)
+	}
+	pending = s.PendingEvents(storeClientNodeV2, cmd.RequestID)
+	if len(pending) != 1 || pending[0].MessageID != events[1].MessageID {
+		t.Fatalf("partial confirmation pending=%+v want message_id=%s", pending, events[1].MessageID)
+	}
+
+	replayed, err := s.BindSession(storeClientNodeV2, cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 2 || replayed[0].MessageID != events[0].MessageID || replayed[1].MessageID != events[1].MessageID {
+		t.Fatalf("cached reply changed after partial confirmation: first=%+v replay=%+v", events, replayed)
+	}
+	if err := s.MarkEventsPublished(storeClientNodeV2, cmd.RequestID, []string{events[1].MessageID}); err != nil {
+		t.Fatal(err)
+	}
+	if pending := s.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 0 {
+		t.Fatalf("fully confirmed request retained deliveries: %+v", pending)
+	}
+
+	third, err := s.BindSession(storeClientNodeV2, cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third) != 2 || third[0].MessageID != events[0].MessageID || third[1].MessageID != events[1].MessageID {
+		t.Fatalf("cached reply/message IDs changed after confirmation: %+v", third)
+	}
+	if pending := s.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 0 {
+		t.Fatalf("confirmed deliveries revived on retry: %+v", pending)
+	}
+}
+
 func TestStoreV2_OpenRestartTwoPhase(t *testing.T) {
 	s, _ := newTestStoreV2(t)
 	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
