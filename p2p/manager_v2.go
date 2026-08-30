@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math/rand/v2"
@@ -38,6 +39,8 @@ var (
 	v2TestHoldRegisterNode    string
 	v2TestBeforeCatchUp       func(*Manager)
 	v2TestCatchUpExtraNeed    int
+	v2TestCatchUpTimeout      time.Duration
+	v2TestCatchUpRetryDelay   time.Duration
 	v2TestDropSessionSync     bool
 	v2TestDropSessionSyncNode string
 	v2TestFailSessionSync     atomic.Bool
@@ -89,7 +92,18 @@ type managerV2 struct {
 	retryMu         sync.Mutex
 	retries         map[MessageKeyV2]signalRetryItemV2
 	retryWake       chan struct{}
+	catchUpCtx      context.Context
+	catchUpCancel   context.CancelFunc
+	catchUpWake     chan struct{}
+	catchUpInitial  chan struct{}
+	catchUpDone     chan struct{}
+	catchUpTimeout  time.Duration
+	catchUpBackoff  func(int) time.Duration
 	stats           v2Stats
+}
+
+func catchUpBackoffV2(attempt int) time.Duration {
+	return time.Duration(RetryAfterMsV2(attempt)) * time.Millisecond
 }
 
 func RetryAfterMsV2(attempt int) int64 {
@@ -138,16 +152,33 @@ func (m *Manager) startV2() error {
 		NodeDisconnectGraceDuration(DefaultClientPingInterval, DefaultClientPingMax),
 		TombstoneDuration(DefaultSetupTimeoutV2),
 	)
+	catchUpCtx, catchUpCancel := context.WithCancel(context.Background())
+	catchUpTimeout := v2CatchUpDiscoverTimeout
+	if v2TestCatchUpTimeout > 0 {
+		catchUpTimeout = v2TestCatchUpTimeout
+	}
+	catchUpBackoff := catchUpBackoffV2
+	if v2TestCatchUpRetryDelay > 0 {
+		delay := v2TestCatchUpRetryDelay
+		catchUpBackoff = func(int) time.Duration { return delay }
+	}
 	m.v2 = &managerV2{
-		store:     store,
-		cmdQ:      make(chan *nats.Msg, qsize),
-		stop:      make(chan struct{}),
-		nodes:     make(map[string]*v2NodeBinding),
-		owners:    make(map[string]*v2SessionMeta),
-		requests:  make(map[RequestKeyV2]string),
-		applied:   make(map[string]struct{}),
-		retries:   make(map[MessageKeyV2]signalRetryItemV2),
-		retryWake: make(chan struct{}, 1),
+		store:          store,
+		cmdQ:           make(chan *nats.Msg, qsize),
+		stop:           make(chan struct{}),
+		nodes:          make(map[string]*v2NodeBinding),
+		owners:         make(map[string]*v2SessionMeta),
+		requests:       make(map[RequestKeyV2]string),
+		applied:        make(map[string]struct{}),
+		retries:        make(map[MessageKeyV2]signalRetryItemV2),
+		retryWake:      make(chan struct{}, 1),
+		catchUpCtx:     catchUpCtx,
+		catchUpCancel:  catchUpCancel,
+		catchUpWake:    make(chan struct{}, 1),
+		catchUpInitial: make(chan struct{}),
+		catchUpDone:    make(chan struct{}),
+		catchUpTimeout: catchUpTimeout,
+		catchUpBackoff: catchUpBackoff,
 	}
 	regSubj := "$P2P.V2.CMD.*.REGISTER." + m.serverID
 	sub, err := m.nc.Subscribe(regSubj, m.handleV2Command)
@@ -158,7 +189,13 @@ func (m *Manager) startV2() error {
 	if err := m.startClusterV2(); err != nil {
 		return err
 	}
-	catchErr := m.catchUpV2()
+	m.v2.wg.Add(1)
+	go m.catchUpLoopV2()
+	select {
+	case <-m.v2.catchUpInitial:
+	case <-m.v2.stop:
+		return errors.New("v2 manager stopped during catch-up")
+	}
 	for i := 0; i < workers; i++ {
 		m.v2.wg.Add(1)
 		go m.v2Worker()
@@ -170,24 +207,6 @@ func (m *Manager) startV2() error {
 	if err := m.startMonitorV2(); err != nil {
 		return err
 	}
-	if catchErr != nil {
-		return m.nc.Flush()
-	}
-	if v2TestHoldJoinQueue != nil {
-		hold := v2TestHoldJoinQueue
-		m.v2.wg.Add(1)
-		go func() {
-			defer m.v2.wg.Done()
-			select {
-			case <-hold:
-			case <-m.v2.stop:
-				return
-			}
-			_ = m.joinExternalQueueV2()
-		}()
-	} else if err := m.joinExternalQueueV2(); err != nil {
-		return err
-	}
 	return m.nc.Flush()
 }
 
@@ -196,21 +215,79 @@ func (m *Manager) stopV2() {
 		return
 	}
 	m.publishOwnerExitV2()
-	for _, sub := range m.v2.mgrSubs {
-		_ = sub.Unsubscribe()
-	}
-	for _, sub := range m.v2.cmdSubs {
-		_ = sub.Unsubscribe()
-	}
-	for _, sub := range m.v2.subs {
-		_ = sub.Unsubscribe()
-	}
+	m.v2.catchUpCancel()
 	select {
 	case <-m.v2.stop:
 	default:
 		close(m.v2.stop)
 	}
 	m.v2.wg.Wait()
+	for _, sub := range m.v2.mgrSubs {
+		_ = sub.Unsubscribe()
+	}
+	for _, sub := range m.v2.subs {
+		_ = sub.Unsubscribe()
+	}
+}
+
+func (m *Manager) catchUpLoopV2() {
+	defer m.v2.wg.Done()
+	initial := true
+	caughtUp := false
+	attempt := 0
+	for {
+		var err error
+		if !caughtUp {
+			err = m.catchUpV2(m.v2.catchUpCtx)
+			caughtUp = err == nil
+		}
+		if initial && !caughtUp {
+			close(m.v2.catchUpInitial)
+			initial = false
+		}
+		if caughtUp {
+			if hold := v2TestHoldJoinQueue; hold != nil {
+				if initial {
+					close(m.v2.catchUpInitial)
+					initial = false
+				}
+				select {
+				case <-hold:
+				case <-m.v2.catchUpCtx.Done():
+					return
+				}
+			}
+			err = m.joinExternalQueueV2()
+			if initial {
+				close(m.v2.catchUpInitial)
+				initial = false
+			}
+			if err == nil {
+				close(m.v2.catchUpDone)
+				return
+			}
+		}
+		timer := time.NewTimer(m.v2.catchUpBackoff(attempt))
+		select {
+		case <-timer.C:
+		case <-m.v2.catchUpWake:
+			timer.Stop()
+		case <-m.v2.catchUpCtx.Done():
+			timer.Stop()
+			return
+		}
+		attempt++
+	}
+}
+
+func (m *Manager) wakeCatchUpV2() {
+	if m == nil || m.v2 == nil {
+		return
+	}
+	select {
+	case m.v2.catchUpWake <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Manager) handleV2Command(msg *nats.Msg) {
@@ -294,6 +371,7 @@ func (m *Manager) handleRegisterV2(msg *nats.Msg, sender, suffix string) {
 		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrInvalidRequestV2, nil)
 		return
 	}
+	m.wakeCatchUpV2()
 	dec, err := DecodeFrameV2(FrameKindRegisterV2, msg.Data)
 	if err != nil {
 		m.replyV2Error(msg, requestIDFromData(msg.Data), protocolCodeV2(err), nil)
@@ -1460,17 +1538,21 @@ func (m *Manager) SessionOwnerV2(sessionID string) (string, uint64, bool) {
 	return meta.Owner, meta.Revision, true
 }
 
-func (m *Manager) dropQueueGroupV2() {
+func (m *Manager) dropQueueGroupV2() error {
 	if m == nil || m.v2 == nil {
-		return
+		return nil
 	}
 	for _, sub := range m.v2.cmdSubs {
 		_ = sub.Unsubscribe()
 	}
 	m.v2.cmdSubs = nil
+	if err := m.nc.Flush(); err != nil {
+		return err
+	}
 	m.v2.mu.Lock()
 	m.v2.joinedQueue = false
 	m.v2.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) setOwnerUnreachableV2(v bool) {

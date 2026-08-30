@@ -963,6 +963,109 @@ func TestClusterV2_IncompleteCatchUpDoesNotJoinQueue(t *testing.T) {
 	}
 }
 
+func TestClusterV2_CatchUpRetriesUntilComplete(t *testing.T) {
+	sA, sB := startClusterPair(t)
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+
+	var attempts atomic.Int32
+	thirdAttempt := make(chan struct{})
+	v2TestCatchUpTimeout = 10 * time.Millisecond
+	v2TestCatchUpRetryDelay = time.Millisecond
+	v2TestBeforeCatchUp = func(m *Manager) {
+		if m.serverID != sB.ID() {
+			return
+		}
+		n := attempts.Add(1)
+		if n < 3 {
+			v2TestCatchUpExtraNeed = 8
+			return
+		}
+		v2TestCatchUpExtraNeed = 0
+		select {
+		case <-thirdAttempt:
+		default:
+			close(thirdAttempt)
+		}
+	}
+	t.Cleanup(func() {
+		v2TestBeforeCatchUp = nil
+		v2TestCatchUpExtraNeed = 0
+		v2TestCatchUpTimeout = 0
+		v2TestCatchUpRetryDelay = 0
+	})
+
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mB.Stop)
+	if mB.joinedQueueGroupV2() {
+		t.Fatal("coordinator joined external queue before catch-up completed")
+	}
+	var wakeWG sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wakeWG.Add(1)
+		go func() {
+			defer wakeWG.Done()
+			mB.wakeCatchUpV2()
+		}()
+	}
+	wakeWG.Wait()
+
+	select {
+	case <-thirdAttempt:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("catch-up stopped retrying after %d attempts", attempts.Load())
+	}
+	select {
+	case <-mB.v2.catchUpDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("coordinator did not join external queue after complete catch-up")
+	}
+	if got := len(mB.v2.cmdSubs); got != 5 {
+		t.Fatalf("concurrent catch-up wake created %d queue subscriptions, want 5", got)
+	}
+}
+
+func TestClusterV2_StopCancelsCatchUpWorker(t *testing.T) {
+	sA, sB := startClusterPair(t)
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+
+	v2TestCatchUpTimeout = 10 * time.Millisecond
+	v2TestCatchUpRetryDelay = time.Hour
+	v2TestCatchUpExtraNeed = 8
+	t.Cleanup(func() {
+		v2TestCatchUpTimeout = 0
+		v2TestCatchUpRetryDelay = 0
+		v2TestCatchUpExtraNeed = 0
+	})
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		mB.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Stop did not cancel catch-up retry worker")
+	}
+}
+
 func TestClusterV2_DisconnectMatchesServerAndCID(t *testing.T) {
 	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
 	node := "pair-node"
@@ -1418,8 +1521,12 @@ func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {
 		t.Fatalf("late join BIND ledger missing or revived: found=%v record=%+v", haveBindRecord, bindRecord)
 	}
 
-	mA.dropQueueGroupV2()
-	mC.dropQueueGroupV2()
+	if err := mA.dropQueueGroupV2(); err != nil {
+		t.Fatal(err)
+	}
+	if err := mC.dropQueueGroupV2(); err != nil {
+		t.Fatal(err)
+	}
 	retry := requestV2Wait(t, client, createSubj, createFrameV2(t, reqID, mgrServerNodeV2), 5*time.Second)
 	again, err := DecodeFrameV2(FrameKindAllocatedV2, retry.Data)
 	if err != nil {

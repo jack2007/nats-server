@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -673,7 +674,7 @@ func (m *Manager) applySnapshotReplyV2(snap v2SnapshotReply) {
 	}
 }
 
-func (m *Manager) catchUpV2() error {
+func (m *Manager) catchUpV2(ctx context.Context) error {
 	if v2TestBeforeCatchUp != nil {
 		v2TestBeforeCatchUp(m)
 	}
@@ -691,22 +692,24 @@ func (m *Manager) catchUpV2() error {
 	if err := nc.PublishRequest(subjectV2MgrSnapshot, inbox, []byte(m.serverID)); err != nil {
 		return err
 	}
-	discover := v2CatchUpDiscoverTimeout
+	discover := m.v2.catchUpTimeout
 	if extra == 0 && !m.inCluster() {
-		discover = 50 * time.Millisecond
+		discover = min(discover, 50*time.Millisecond)
 	}
-	deadline := m.now().Add(discover)
+	deadline := time.Now().Add(discover)
 	if extra > 0 {
-		deadline = m.now().Add(v2ClusterSyncTimeout)
+		deadline = time.Now().Add(m.v2.catchUpTimeout)
 	}
-	got := 0
+	seen := make(map[string]struct{})
 	peerSnap := false
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
 		}
-		msg, err := sub.NextMsg(remaining)
+		waitCtx, cancel := context.WithTimeout(ctx, remaining)
+		msg, err := sub.NextMsgWithContext(waitCtx)
+		cancel()
 		if err != nil {
 			break
 		}
@@ -718,14 +721,14 @@ func (m *Manager) catchUpV2() error {
 			continue
 		}
 		m.applySnapshotReplyV2(snap)
-		got++
+		seen[snap.Sender] = struct{}{}
 		peerSnap = true
 		need := m.catchUpPeerCountV2()
 		if need < 1 {
 			need = 1
 		}
 		need += extra
-		if extra == 0 && got >= need {
+		if extra == 0 && len(seen) >= need {
 			return nil
 		}
 	}
@@ -738,7 +741,7 @@ func (m *Manager) catchUpV2() error {
 		need = 1
 	}
 	need += extra
-	if got < need {
+	if len(seen) < need {
 		return errV2CatchUpIncomplete
 	}
 	return nil
@@ -753,6 +756,7 @@ func (m *Manager) joinExternalQueueV2() error {
 		return nil
 	}
 	m.v2.mu.Unlock()
+	var joined []*nats.Subscription
 	for _, suffix := range []string{
 		"SESSION.CREATE",
 		"SESSION.COMMAND",
@@ -762,15 +766,22 @@ func (m *Manager) joinExternalQueueV2() error {
 	} {
 		sub, err := m.nc.QueueSubscribe("$P2P.V2.CMD.*."+suffix, v2CoordinatorQueue, m.handleV2Command)
 		if err != nil {
+			for _, joinedSub := range joined {
+				_ = joinedSub.Unsubscribe()
+			}
 			return err
 		}
-		m.v2.cmdSubs = append(m.v2.cmdSubs, sub)
-		m.v2.subs = append(m.v2.subs, sub)
+		joined = append(joined, sub)
 	}
 	if err := m.nc.Flush(); err != nil {
+		for _, sub := range joined {
+			_ = sub.Unsubscribe()
+		}
 		return err
 	}
 	m.v2.mu.Lock()
+	m.v2.cmdSubs = append(m.v2.cmdSubs, joined...)
+	m.v2.subs = append(m.v2.subs, joined...)
 	m.v2.joinedQueue = true
 	m.v2.mu.Unlock()
 	return nil
