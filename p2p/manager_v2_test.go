@@ -903,6 +903,118 @@ func TestManagerV2_SessionCloseTombstone(t *testing.T) {
 	}
 }
 
+func TestManagerV2_ConnectionReject(t *testing.T) {
+	s, mgr := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocReply := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, allocReply.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqID := mustUUIDV2(t)
+	frame := connCmdFrameV2(t, reqID, ConnectionCommandRejectV2, ident, alloc.Allocated.Revision)
+	reply := requestV2(t, client, connSubj, frame)
+	if !bytesContainsOK(reply.Data) {
+		t.Fatalf("REJECT reply must be OK: %s", reply.Data)
+	}
+	cClose := nextEventV2(t, clientEv, FrameKindCloseV2)
+	sClose := nextEventV2(t, serverEv, FrameKindCloseV2)
+	if cClose.Close.MessageID == "" || cClose.Close.MessageID != cClose.Envelope.MessageID || sClose.Close.MessageID == "" || sClose.Close.MessageID != sClose.Envelope.MessageID {
+		t.Fatalf("CLOSE message IDs must be stable client=%+v server=%+v", cClose.Close, sClose.Close)
+	}
+	if cClose.Close.Revision != alloc.Allocated.Revision+1 || sClose.Close.Revision != cClose.Close.Revision {
+		t.Fatalf("CLOSE revisions client=%d server=%d allocated=%d", cClose.Close.Revision, sClose.Close.Revision, alloc.Allocated.Revision)
+	}
+	if snap, ok := mgr.v2.store.PeekSession(ident.SessionID); !ok || snap.Revision != cClose.Close.Revision {
+		t.Fatalf("store revision after REJECT ok=%v snapshot=%+v", ok, snap)
+	}
+
+	repeat := requestV2(t, client, connSubj, frame)
+	if !bytesContainsOK(repeat.Data) {
+		t.Fatalf("duplicate REJECT reply must be OK: %s", repeat.Data)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+}
+
+func TestManagerV2_ConnectionRejectSyncReleasesSessionLock(t *testing.T) {
+	s, _ := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+
+	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocReply := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, allocReply.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate := &v2SessionSyncGate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	v2TestSessionSyncGate.Store(gate)
+	t.Cleanup(func() { v2TestSessionSyncGate.Store((*v2SessionSyncGate)(nil)) })
+	rejectReq := mustUUIDV2(t)
+	rejectFrame := connCmdFrameV2(t, rejectReq, ConnectionCommandRejectV2, ident, alloc.Allocated.Revision)
+	rejectDone := make(chan *nats.Msg, 1)
+	rejectErr := make(chan error, 1)
+	go func() {
+		got, err := client.Request(connSubj, rejectFrame, 2*time.Second)
+		if err != nil {
+			rejectErr <- err
+			return
+		}
+		rejectDone <- got
+	}()
+	select {
+	case <-gate.entered:
+	case <-time.After(time.Second):
+		t.Fatal("REJECT never entered blocked sync")
+	}
+
+	ready, err := client.Request(connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, alloc.Allocated.Revision), 250*time.Millisecond)
+	if err != nil {
+		t.Fatalf("READY was blocked by REJECT sync: %v", err)
+	}
+	if perr := mustErrorV2(t, ready.Data); perr.Code != ErrInvalidStateV2 {
+		t.Fatalf("READY during rejected state=%+v body=%s", perr, ready.Data)
+	}
+	close(gate.release)
+	select {
+	case err := <-rejectErr:
+		t.Fatal(err)
+	case reply := <-rejectDone:
+		if !bytesContainsOK(reply.Data) {
+			t.Fatalf("REJECT reply must be OK: %s", reply.Data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("REJECT did not resume after sync gate release")
+	}
+}
+
 func mustCreateBindReadySessionV2(t *testing.T, client, srv *nats.Conn, clientEv, serverEv <-chan *nats.Msg) (IdentityV2, uint64) {
 	t.Helper()
 	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")

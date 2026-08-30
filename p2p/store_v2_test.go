@@ -672,6 +672,156 @@ func TestStoreV2_CloseConnection(t *testing.T) {
 	}
 }
 
+func TestStoreV2_RejectConnection(t *testing.T) {
+	newSession := func(t *testing.T) (*StoreV2, SessionSnapshotV2) {
+		t.Helper()
+		s, _ := newTestStoreV2(t)
+		mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+		mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+		return s, mustAllocateSessionV2(t, s, storeClientNodeV2)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, s *StoreV2, snap SessionSnapshotV2) (IdentityV2, uint64)
+	}{
+		{
+			name: "allocated",
+			setup: func(t *testing.T, _ *StoreV2, snap SessionSnapshotV2) (IdentityV2, uint64) {
+				return IdentityV2{SessionID: snap.SessionID, ConnectionID: "conn-0", Epoch: 1}, snap.Revision
+			},
+		},
+		{
+			name: "preparing",
+			setup: func(t *testing.T, s *StoreV2, snap SessionSnapshotV2) (IdentityV2, uint64) {
+				events, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, snap.SessionID, "conn-0", 1, snap.Revision))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return IdentityV2{SessionID: snap.SessionID, ConnectionID: "conn-0", Epoch: 1}, events[0].Revision
+			},
+		},
+		{
+			name: "restarting",
+			setup: func(t *testing.T, s *StoreV2, snap SessionSnapshotV2) (IdentityV2, uint64) {
+				s.mu.Lock()
+				s.sessions[snap.SessionID].connections["conn-0"].state = ConnectionStateRestartingV2
+				s.mu.Unlock()
+				return IdentityV2{SessionID: snap.SessionID, ConnectionID: "conn-0", Epoch: 1}, snap.Revision
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, snap := newSession(t)
+			ident, rev := tc.setup(t, s, snap)
+			cmd := connCmdV2(t, ConnectionCommandRejectV2, ident.SessionID, ident.ConnectionID, ident.Epoch, rev)
+			events, err := s.RejectConnection(storeClientNodeV2, cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireBothKindsV2(t, events, FrameKindCloseV2)
+			if got := sessionRevisionV2(t, s, ident.SessionID); got != rev+1 {
+				t.Fatalf("revision=%d want %d", got, rev+1)
+			}
+			s.mu.Lock()
+			state := s.sessions[ident.SessionID].connections[ident.ConnectionID].state
+			s.mu.Unlock()
+			if state != ConnectionStateClosedV2 {
+				t.Fatalf("state=%s want closed", state)
+			}
+
+			again, err := s.RejectConnection(storeClientNodeV2, cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(again) != 0 {
+				t.Fatalf("duplicate request must not create additional CLOSE events: %+v", again)
+			}
+		})
+	}
+
+	t.Run("rejects active non-member and wrong epoch without mutation", func(t *testing.T) {
+		s, snap := newSession(t)
+		ident := IdentityV2{SessionID: snap.SessionID, ConnectionID: "conn-0", Epoch: 1}
+		bind, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, ident.SessionID, ident.ConnectionID, ident.Epoch, snap.Revision))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, ident.SessionID, ident.ConnectionID, ident.Epoch, bind[0].Revision)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, ident.SessionID, ident.ConnectionID, ident.Epoch, bind[0].Revision)); err != nil {
+			t.Fatal(err)
+		}
+		rev := sessionRevisionV2(t, s, ident.SessionID)
+		if _, err := s.RejectConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandRejectV2, ident.SessionID, ident.ConnectionID, ident.Epoch, rev)); err == nil {
+			t.Fatal("active reject must fail")
+		} else {
+			requireCodeV2(t, err, ErrInvalidStateV2)
+		}
+		mustRegisterNodeV2(t, s, storeOtherNodeV2, storeOtherRegV2)
+		if _, err := s.RejectConnection(storeOtherNodeV2, connCmdV2(t, ConnectionCommandRejectV2, ident.SessionID, ident.ConnectionID, ident.Epoch, rev)); err == nil {
+			t.Fatal("non-member reject must fail")
+		} else {
+			requireCodeV2(t, err, ErrNotSessionMemberV2)
+		}
+		s.mu.Lock()
+		s.sessions[ident.SessionID].connections[ident.ConnectionID].epoch = 2
+		s.sessions[ident.SessionID].connections[ident.ConnectionID].state = ConnectionStatePreparingV2
+		s.mu.Unlock()
+		for _, tc := range []struct {
+			name  string
+			epoch uint64
+			code  ErrorCodeV2
+		}{{"stale", 1, ErrStaleEpochV2}, {"future", 3, ErrFutureEpochV2}} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := s.RejectConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandRejectV2, ident.SessionID, ident.ConnectionID, tc.epoch, rev))
+				requireCodeV2(t, err, tc.code)
+			})
+		}
+		if got := sessionRevisionV2(t, s, ident.SessionID); got != rev {
+			t.Fatalf("failed reject mutated revision=%d want %d", got, rev)
+		}
+	})
+
+	t.Run("clears pending signals", func(t *testing.T) {
+		s, snap := newSession(t)
+		ident := IdentityV2{SessionID: snap.SessionID, ConnectionID: "conn-0", Epoch: 1}
+		bind, err := s.BindConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandBindV2, ident.SessionID, ident.ConnectionID, ident.Epoch, snap.Revision))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.MarkConnectionReady(storeClientNodeV2, connCmdV2(t, ConnectionCommandReadyV2, ident.SessionID, ident.ConnectionID, ident.Epoch, bind[0].Revision)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.MarkConnectionReady(storeServerNodeV2, connCmdV2(t, ConnectionCommandReadyV2, ident.SessionID, ident.ConnectionID, ident.Epoch, bind[0].Revision)); err != nil {
+			t.Fatal(err)
+		}
+		cmd := signalSendCmdV2(t, ident, 1, SignalKindEndOfCandidatesV2, SignalPayloadV2{})
+		if _, _, err := s.AcceptSignal(storeClientNodeV2, cmd); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.AcceptSignal(storeServerNodeV2, signalSendCmdV2(t, ident, 1, SignalKindEndOfCandidatesV2, SignalPayloadV2{})); err != nil {
+			t.Fatal(err)
+		}
+		dir := dirKeyV2(snap, storeClientNodeV2)
+		reverseDir := dirKeyV2(snap, storeServerNodeV2)
+		if s.directionPending(dir) != 1 || s.directionPending(reverseDir) != 1 {
+			t.Fatalf("expected bidirectional pending signals: client=%d server=%d", s.directionPending(dir), s.directionPending(reverseDir))
+		}
+		s.mu.Lock()
+		s.sessions[ident.SessionID].connections[ident.ConnectionID].state = ConnectionStatePreparingV2
+		rev := s.sessions[ident.SessionID].revision
+		s.mu.Unlock()
+		if _, err := s.RejectConnection(storeClientNodeV2, connCmdV2(t, ConnectionCommandRejectV2, ident.SessionID, ident.ConnectionID, ident.Epoch, rev)); err != nil {
+			t.Fatal(err)
+		}
+		if s.directionPending(dir) != 0 || s.directionPending(reverseDir) != 0 || s.hasDirection(dir) || s.hasDirection(reverseDir) {
+			t.Fatalf("reject must drop pending generation: client pending=%d has=%v server pending=%d has=%v", s.directionPending(dir), s.hasDirection(dir), s.directionPending(reverseDir), s.hasDirection(reverseDir))
+		}
+	})
+}
+
 func TestStoreV2_BindConnectionRequiresRevision(t *testing.T) {
 	s, _ := newTestStoreV2(t)
 	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)

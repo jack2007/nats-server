@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -38,7 +39,14 @@ var (
 	v2TestCatchUpExtraNeed    int
 	v2TestDropSessionSync     bool
 	v2TestDropSessionSyncNode string
+	v2TestFailSessionSync     atomic.Bool
+	v2TestSessionSyncGate     atomic.Value
 )
+
+type v2SessionSyncGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
 
 type v2NodeBinding struct {
 	registrationID string
@@ -409,16 +417,17 @@ func (m *Manager) handleCreateV2(msg *nats.Msg, sender string) {
 	}
 	m.v2.mu.Lock()
 	m.v2.owners[snap.SessionID] = &v2SessionMeta{
-		SessionID:      snap.SessionID,
-		Owner:          m.serverID,
-		Revision:       snap.Revision,
-		RequestID:      dec.Create.RequestID,
-		ClientNode:     snap.ClientNodeKey,
-		ServerNode:     snap.ServerNodeKey,
-		State:          snap.State,
-		ConnectionID:   snap.ConnectionID,
-		Epoch:          snap.Epoch,
-		SetupTimeoutMs: timeoutMs,
+		SessionID:       snap.SessionID,
+		Owner:           m.serverID,
+		Revision:        snap.Revision,
+		RequestID:       dec.Create.RequestID,
+		ClientNode:      snap.ClientNodeKey,
+		ServerNode:      snap.ServerNodeKey,
+		State:           snap.State,
+		ConnectionID:    snap.ConnectionID,
+		ConnectionState: snap.ConnectionState,
+		Epoch:           snap.Epoch,
+		SetupTimeoutMs:  timeoutMs,
 	}
 	m.v2.requests[key] = snap.SessionID
 	m.v2.mu.Unlock()
@@ -488,7 +497,12 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 	}
 	cmd := *dec.Connection
 	unlock := m.lockSessionV2(cmd.SessionID)
-	defer unlock()
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 	switch cmd.Command {
 	case ConnectionCommandOpenV2:
 		snap, err := m.v2.store.AllocateConnection(sender, cmd)
@@ -548,6 +562,36 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			}
 		}
 		m.noteRevisionSyncV2(m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender))
+		m.replyV2OK(msg, cmd.RequestID)
+	case ConnectionCommandRejectV2:
+		events, err := m.v2.store.RejectConnection(sender, cmd)
+		if err != nil {
+			if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
+				return
+			}
+			m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
+			return
+		}
+		snap, haveSession := m.v2.store.PeekSession(cmd.SessionID)
+		connections, haveConnections := m.v2.store.PeekConnections(cmd.SessionID)
+		unlock()
+		locked = false
+		if !haveSession || !haveConnections {
+			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
+			return
+		}
+		m.dropSignalRetriesForGenerationV2(GenerationKeyV2{SessionID: cmd.SessionID, ConnectionID: cmd.ConnectionID, Epoch: cmd.Epoch})
+		if err := m.publishEventsV2(events); err != nil {
+			m.replyV2Error(msg, cmd.RequestID, ErrInternalErrorV2, nil)
+			return
+		}
+		if err := m.syncSessionConnectionsV2(snap, connections, cmd.RequestID, sender); err != nil {
+			m.noteRevisionSyncV2(err)
+			ms := RetryAfterMsV2(0)
+			m.replyV2Error(msg, cmd.RequestID, ErrBusyV2, &ms)
+			return
+		}
+		m.noteRevisionSyncV2(nil)
 		m.replyV2OK(msg, cmd.RequestID)
 	case ConnectionCommandCloseV2:
 		events, err := m.v2.store.CloseConnection(sender, cmd)
@@ -1206,16 +1250,18 @@ func (m *Manager) replyKnownCreateOwnerV2(msg *nats.Msg, sender, requestID strin
 
 func mutationSessionMetaV2(mut v2MgrMutation) v2SessionMeta {
 	return v2SessionMeta{
-		SessionID:      mut.SessionID,
-		Owner:          mut.Owner,
-		Revision:       mut.Revision,
-		RequestID:      mut.RequestID,
-		ClientNode:     mut.ClientNodeKey,
-		ServerNode:     mut.ServerNodeKey,
-		State:          SessionStateV2(mut.State),
-		ConnectionID:   mut.ConnectionID,
-		Epoch:          mut.Epoch,
-		SetupTimeoutMs: mut.SetupTimeoutMs,
+		SessionID:       mut.SessionID,
+		Owner:           mut.Owner,
+		Revision:        mut.Revision,
+		RequestID:       mut.RequestID,
+		ClientNode:      mut.ClientNodeKey,
+		ServerNode:      mut.ServerNodeKey,
+		State:           SessionStateV2(mut.State),
+		ConnectionID:    mut.ConnectionID,
+		ConnectionState: ConnectionStateV2(mut.ConnectionState),
+		Connections:     cloneV2ConnectionSnapshots(mutationConnectionsV2(mut)),
+		Epoch:           mut.Epoch,
+		SetupTimeoutMs:  mut.SetupTimeoutMs,
 	}
 }
 

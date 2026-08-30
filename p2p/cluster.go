@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/json"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -537,26 +538,34 @@ func v2MgrCommandSubject(ownerID string) string {
 }
 
 type v2MgrMutation struct {
-	MutationID        string `json:"mutation_id"`
-	MessageID         string `json:"message_id"`
-	Kind              string `json:"kind"`
-	SessionID         string `json:"session_id,omitempty"`
-	Owner             string `json:"owner"`
-	Revision          uint64 `json:"revision"`
-	Sender            string `json:"sender"`
-	RequestID         string `json:"request_id,omitempty"`
-	NodeKey           string `json:"node_key,omitempty"`
-	RegistrationID    string `json:"registration_id,omitempty"`
-	RegistrationEpoch uint64 `json:"registration_epoch,omitempty"`
-	CID               uint64 `json:"cid,omitempty"`
-	NatsServerID      string `json:"nats_server_id,omitempty"`
-	ClientNodeKey     string `json:"client_node_key,omitempty"`
-	ServerNodeKey     string `json:"server_node_key,omitempty"`
-	State             string `json:"state,omitempty"`
-	ConnectionID      string `json:"connection_id,omitempty"`
-	Epoch             uint64 `json:"epoch,omitempty"`
-	SetupTimeoutMs    int64  `json:"setup_timeout_ms,omitempty"`
-	Pending           bool   `json:"pending,omitempty"`
+	MutationID        string                 `json:"mutation_id"`
+	MessageID         string                 `json:"message_id"`
+	Kind              string                 `json:"kind"`
+	SessionID         string                 `json:"session_id,omitempty"`
+	Owner             string                 `json:"owner"`
+	Revision          uint64                 `json:"revision"`
+	Sender            string                 `json:"sender"`
+	RequestID         string                 `json:"request_id,omitempty"`
+	NodeKey           string                 `json:"node_key,omitempty"`
+	RegistrationID    string                 `json:"registration_id,omitempty"`
+	RegistrationEpoch uint64                 `json:"registration_epoch,omitempty"`
+	CID               uint64                 `json:"cid,omitempty"`
+	NatsServerID      string                 `json:"nats_server_id,omitempty"`
+	ClientNodeKey     string                 `json:"client_node_key,omitempty"`
+	ServerNodeKey     string                 `json:"server_node_key,omitempty"`
+	State             string                 `json:"state,omitempty"`
+	ConnectionID      string                 `json:"connection_id,omitempty"`
+	ConnectionState   string                 `json:"connection_state,omitempty"`
+	Connections       []v2ConnectionSnapshot `json:"connections,omitempty"`
+	Epoch             uint64                 `json:"epoch,omitempty"`
+	SetupTimeoutMs    int64                  `json:"setup_timeout_ms,omitempty"`
+	Pending           bool                   `json:"pending,omitempty"`
+}
+
+type v2ConnectionSnapshot struct {
+	ConnectionID string `json:"connection_id"`
+	Epoch        uint64 `json:"epoch"`
+	State        string `json:"state"`
 }
 
 type v2MgrAck struct {
@@ -576,17 +585,19 @@ type v2SnapshotReply struct {
 }
 
 type v2SessionMeta struct {
-	SessionID      string
-	Owner          string
-	Revision       uint64
-	RequestID      string
-	ClientNode     string
-	ServerNode     string
-	State          SessionStateV2
-	ConnectionID   string
-	Epoch          uint64
-	SetupTimeoutMs int64
-	Lost           bool
+	SessionID       string
+	Owner           string
+	Revision        uint64
+	RequestID       string
+	ClientNode      string
+	ServerNode      string
+	State           SessionStateV2
+	ConnectionID    string
+	ConnectionState ConnectionStateV2
+	Connections     []v2ConnectionSnapshot
+	Epoch           uint64
+	SetupTimeoutMs  int64
+	Lost            bool
 }
 
 func (m *Manager) startClusterV2() error {
@@ -764,6 +775,20 @@ func (m *Manager) syncMutationV2(mut v2MgrMutation) error {
 	if !m.applyMutationV2(mut) {
 		return errors.New("local apply rejected")
 	}
+	if v2TestFailSessionSync.Load() && mut.Kind == v2MutationSession {
+		return errV2SyncTimeout
+	}
+	if gate, _ := v2TestSessionSyncGate.Load().(*v2SessionSyncGate); gate != nil && mut.Kind == v2MutationSession {
+		select {
+		case gate.entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-gate.release:
+		case <-m.v2.stop:
+			return errors.New("stopped")
+		}
+	}
 	alive := []string{m.serverID}
 	if m.peers != nil {
 		alive = m.peers.alive(m.now())
@@ -915,20 +940,22 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 	}
 	for _, meta := range m.v2.owners {
 		sessions = append(sessions, v2MgrMutation{
-			MutationID:     "snap-sess-" + meta.SessionID,
-			MessageID:      "snap-sess-" + meta.SessionID,
-			Kind:           v2MutationSession,
-			SessionID:      meta.SessionID,
-			Owner:          meta.Owner,
-			Revision:       meta.Revision,
-			Sender:         m.serverID,
-			RequestID:      meta.RequestID,
-			ClientNodeKey:  meta.ClientNode,
-			ServerNodeKey:  meta.ServerNode,
-			State:          string(meta.State),
-			ConnectionID:   meta.ConnectionID,
-			Epoch:          meta.Epoch,
-			SetupTimeoutMs: meta.SetupTimeoutMs,
+			MutationID:      "snap-sess-" + meta.SessionID,
+			MessageID:       "snap-sess-" + meta.SessionID,
+			Kind:            v2MutationSession,
+			SessionID:       meta.SessionID,
+			Owner:           meta.Owner,
+			Revision:        meta.Revision,
+			Sender:          m.serverID,
+			RequestID:       meta.RequestID,
+			ClientNodeKey:   meta.ClientNode,
+			ServerNodeKey:   meta.ServerNode,
+			State:           string(meta.State),
+			ConnectionID:    meta.ConnectionID,
+			ConnectionState: string(meta.ConnectionState),
+			Connections:     cloneV2ConnectionSnapshots(meta.Connections),
+			Epoch:           meta.Epoch,
+			SetupTimeoutMs:  meta.SetupTimeoutMs,
 		})
 	}
 	m.v2.mu.Unlock()
@@ -1021,7 +1048,7 @@ func (m *Manager) applyMutationV2(mut v2MgrMutation) bool {
 				m.v2.mu.Unlock()
 				return false
 			}
-			if mut.Revision == meta.Revision {
+			if mut.Revision == meta.Revision && len(mut.Connections) == 0 {
 				m.v2.applied[mut.MutationID] = struct{}{}
 				m.v2.mu.Unlock()
 				return true
@@ -1043,6 +1070,8 @@ func (m *Manager) applyMutationV2(mut v2MgrMutation) bool {
 		meta.ServerNode = mut.ServerNodeKey
 		meta.State = SessionStateV2(mut.State)
 		meta.ConnectionID = mut.ConnectionID
+		meta.ConnectionState = ConnectionStateV2(mut.ConnectionState)
+		meta.Connections = cloneV2ConnectionSnapshots(mutationConnectionsV2(mut))
 		meta.Epoch = mut.Epoch
 		meta.SetupTimeoutMs = mut.SetupTimeoutMs
 		if mut.RequestID != "" && mut.ClientNodeKey != "" {
@@ -1180,18 +1209,28 @@ func (m *Manager) syncSessionLockedV2(sessionID, requestID, sender string) error
 	if !ok {
 		return nil
 	}
+	connections, ok := m.v2.store.PeekConnections(sessionID)
+	if !ok {
+		return nil
+	}
+	return m.syncSessionConnectionsV2(snap, connections, requestID, sender)
+}
+
+func (m *Manager) syncSessionConnectionsV2(snap SessionSnapshotV2, connections []ConnectionSnapshotV2, requestID, sender string) error {
 	m.v2.mu.Lock()
-	meta := m.v2.owners[sessionID]
+	meta := m.v2.owners[snap.SessionID]
 	if meta == nil {
-		meta = &v2SessionMeta{SessionID: sessionID, Owner: m.serverID}
-		m.v2.owners[sessionID] = meta
+		meta = &v2SessionMeta{SessionID: snap.SessionID, Owner: m.serverID}
+		m.v2.owners[snap.SessionID] = meta
 	}
 	meta.Revision = snap.Revision
 	meta.State = snap.State
 	meta.ClientNode = snap.ClientNodeKey
 	meta.ServerNode = snap.ServerNodeKey
 	meta.ConnectionID = snap.ConnectionID
+	meta.ConnectionState = snap.ConnectionState
 	meta.Epoch = snap.Epoch
+	meta.Connections = v2ConnectionSnapshotsFromStore(connections)
 	if requestID != "" && meta.RequestID == "" {
 		meta.RequestID = requestID
 	}
@@ -1199,20 +1238,58 @@ func (m *Manager) syncSessionLockedV2(sessionID, requestID, sender string) error
 		meta.ClientNode = sender
 	}
 	mut := v2MgrMutation{
-		Kind:           v2MutationSession,
-		SessionID:      sessionID,
-		Owner:          meta.Owner,
-		Revision:       meta.Revision,
-		RequestID:      meta.RequestID,
-		ClientNodeKey:  meta.ClientNode,
-		ServerNodeKey:  meta.ServerNode,
-		State:          string(meta.State),
-		ConnectionID:   meta.ConnectionID,
-		Epoch:          meta.Epoch,
-		SetupTimeoutMs: meta.SetupTimeoutMs,
+		Kind:            v2MutationSession,
+		SessionID:       snap.SessionID,
+		Owner:           meta.Owner,
+		Revision:        meta.Revision,
+		RequestID:       meta.RequestID,
+		ClientNodeKey:   meta.ClientNode,
+		ServerNodeKey:   meta.ServerNode,
+		State:           string(meta.State),
+		ConnectionID:    meta.ConnectionID,
+		ConnectionState: string(meta.ConnectionState),
+		Connections:     cloneV2ConnectionSnapshots(meta.Connections),
+		Epoch:           meta.Epoch,
+		SetupTimeoutMs:  meta.SetupTimeoutMs,
 	}
 	m.v2.mu.Unlock()
 	return m.syncMutationV2(mut)
+}
+
+func v2ConnectionSnapshotsFromStore(connections []ConnectionSnapshotV2) []v2ConnectionSnapshot {
+	out := make([]v2ConnectionSnapshot, 0, len(connections))
+	for _, conn := range connections {
+		out = append(out, v2ConnectionSnapshot{ConnectionID: conn.ConnectionID, Epoch: conn.Epoch, State: string(conn.State)})
+	}
+	return cloneV2ConnectionSnapshots(out)
+}
+
+func cloneV2ConnectionSnapshots(connections []v2ConnectionSnapshot) []v2ConnectionSnapshot {
+	if len(connections) == 0 {
+		return nil
+	}
+	out := append([]v2ConnectionSnapshot(nil), connections...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ConnectionID < out[j].ConnectionID })
+	return out
+}
+
+func mutationConnectionsV2(mut v2MgrMutation) []v2ConnectionSnapshot {
+	if len(mut.Connections) != 0 {
+		return cloneV2ConnectionSnapshots(mut.Connections)
+	}
+	connectionID := mut.ConnectionID
+	if connectionID == "" {
+		connectionID = "conn-0"
+	}
+	epoch := mut.Epoch
+	if epoch == 0 {
+		epoch = 1
+	}
+	state := mut.ConnectionState
+	if state == "" {
+		state = string(ConnectionStateAllocatedV2)
+	}
+	return []v2ConnectionSnapshot{{ConnectionID: connectionID, Epoch: epoch, State: state}}
 }
 
 func (s *StoreV2) importSessionReplicaV2(mut v2MgrMutation) {
@@ -1240,20 +1317,8 @@ func (s *StoreV2) importSessionReplicaV2(mut v2MgrMutation) {
 		if sess.state == "" {
 			sess.state = SessionStateAllocatedV2
 		}
-		epoch := mut.Epoch
-		if epoch == 0 {
-			epoch = 1
-		}
-		connID := mut.ConnectionID
-		if connID == "" {
-			connID = "conn-0"
-		}
-		sess.connections[connID] = &connectionRecordV2{
-			id:            connID,
-			epoch:         epoch,
-			state:         ConnectionStateAllocatedV2,
-			ready:         make(map[string]bool),
-			setupDeadline: sess.setupDeadline,
+		for _, snapshot := range mutationConnectionsV2(mut) {
+			sess.connections[snapshot.ConnectionID] = replicaConnectionV2(snapshot, sess.setupDeadline)
 		}
 		s.sessions[mut.SessionID] = sess
 		if mut.RequestID != "" && mut.ClientNodeKey != "" {
@@ -1270,7 +1335,28 @@ func (s *StoreV2) importSessionReplicaV2(mut v2MgrMutation) {
 		if mut.State != "" {
 			sess.state = SessionStateV2(mut.State)
 		}
+		for _, snapshot := range mutationConnectionsV2(mut) {
+			conn := sess.connections[snapshot.ConnectionID]
+			if conn == nil {
+				sess.connections[snapshot.ConnectionID] = replicaConnectionV2(snapshot, sess.setupDeadline)
+				continue
+			}
+			conn.epoch = snapshot.Epoch
+			conn.state = ConnectionStateV2(snapshot.State)
+		}
 	}
+}
+
+func replicaConnectionV2(snapshot v2ConnectionSnapshot, deadline time.Time) *connectionRecordV2 {
+	epoch := snapshot.Epoch
+	if epoch == 0 {
+		epoch = 1
+	}
+	state := ConnectionStateV2(snapshot.State)
+	if state == "" {
+		state = ConnectionStateAllocatedV2
+	}
+	return &connectionRecordV2{id: snapshot.ConnectionID, epoch: epoch, state: state, ready: make(map[string]bool), setupDeadline: deadline}
 }
 
 func (s *StoreV2) failSessionIfNegotiatingV2(id string) []EventV2 {

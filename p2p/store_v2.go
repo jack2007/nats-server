@@ -42,13 +42,14 @@ type NodeSnapshotV2 struct {
 }
 
 type SessionSnapshotV2 struct {
-	SessionID     string
-	ConnectionID  string
-	Epoch         uint64
-	State         SessionStateV2
-	Revision      uint64
-	ClientNodeKey string
-	ServerNodeKey string
+	SessionID       string
+	ConnectionID    string
+	Epoch           uint64
+	State           SessionStateV2
+	ConnectionState ConnectionStateV2
+	Revision        uint64
+	ClientNodeKey   string
+	ServerNodeKey   string
 }
 
 type ConnectionSnapshotV2 struct {
@@ -500,6 +501,35 @@ func (s *StoreV2) CloseConnection(sender string, cmd ConnectionCommandV2) ([]Eve
 	return events, nil
 }
 
+func (s *StoreV2) RejectConnection(sender string, cmd ConnectionCommandV2) ([]EventV2, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ValidateUUIDV2(cmd.RequestID); err != nil {
+		return nil, err
+	}
+	key := RequestKeyV2{SenderNodeKey: sender, RequestID: cmd.RequestID}
+	if rec, ok := s.requests[key]; ok && rec.hasEv {
+		return nil, nil
+	}
+	if _, err := s.requireNode(sender); err != nil {
+		return nil, err
+	}
+	sess, conn, err := s.requireMemberConn(sender, cmd)
+	if err != nil {
+		return nil, err
+	}
+	if conn.state != ConnectionStateAllocatedV2 && conn.state != ConnectionStatePreparingV2 && conn.state != ConnectionStateRestartingV2 {
+		return nil, codeErrV2(ErrInvalidStateV2)
+	}
+	sess.revision++
+	conn.state = ConnectionStateClosedV2
+	s.dropGenerationLocked(sess.id, conn.id, conn.epoch)
+	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
+	conn.closeEvents = events
+	s.requests[key] = requestRecordV2{sessionID: sess.id, hasEv: true}
+	return events, nil
+}
+
 func (s *StoreV2) ExpirePendingSignals(now time.Time) []EventV2 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -653,6 +683,45 @@ func (s *StoreV2) PeekSession(id string) (SessionSnapshotV2, bool) {
 		return sessionSnapV2(sess), true
 	}
 	return SessionSnapshotV2{}, false
+}
+
+func (s *StoreV2) PeekConnection(sessionID, connectionID string) (ConnectionSnapshotV2, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		sess, ok = s.tombs[sessionID]
+	}
+	if !ok {
+		return ConnectionSnapshotV2{}, false
+	}
+	conn, ok := sess.connections[connectionID]
+	if !ok {
+		return ConnectionSnapshotV2{}, false
+	}
+	return connSnapV2(sess, conn), true
+}
+
+func (s *StoreV2) PeekConnections(sessionID string) ([]ConnectionSnapshotV2, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		sess, ok = s.tombs[sessionID]
+	}
+	if !ok {
+		return nil, false
+	}
+	ids := make([]string, 0, len(sess.connections))
+	for id := range sess.connections {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	snaps := make([]ConnectionSnapshotV2, 0, len(ids))
+	for _, id := range ids {
+		snaps = append(snaps, connSnapV2(sess, sess.connections[id]))
+	}
+	return snaps, true
 }
 
 func (s *StoreV2) requireMemberConn(sender string, cmd ConnectionCommandV2) (*sessionRecordV2, *connectionRecordV2, error) {
@@ -961,18 +1030,21 @@ func sessionSnapV2(sess *sessionRecordV2) SessionSnapshotV2 {
 	conn := sess.connections["conn-0"]
 	epoch := uint64(1)
 	connID := "conn-0"
+	connState := ConnectionStateAllocatedV2
 	if conn != nil {
 		epoch = conn.epoch
 		connID = conn.id
+		connState = conn.state
 	}
 	return SessionSnapshotV2{
-		SessionID:     sess.id,
-		ConnectionID:  connID,
-		Epoch:         epoch,
-		State:         sess.state,
-		Revision:      sess.revision,
-		ClientNodeKey: sess.client,
-		ServerNodeKey: sess.server,
+		SessionID:       sess.id,
+		ConnectionID:    connID,
+		Epoch:           epoch,
+		State:           sess.state,
+		ConnectionState: connState,
+		Revision:        sess.revision,
+		ClientNodeKey:   sess.client,
+		ServerNodeKey:   sess.server,
 	}
 }
 

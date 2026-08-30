@@ -282,6 +282,160 @@ func TestClusterV2_QueueGroupOwnerAndRevisionSync(t *testing.T) {
 	_ = sC
 }
 
+func TestClusterV2_ConnectionRejectReplicaRevisionSync(t *testing.T) {
+	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
+	managers := []*Manager{mA, mB, mC}
+	clientReg := newRegistrationIDV2(t)
+	serverReg := newRegistrationIDV2(t)
+	client := registerOnServerV2(t, sA, mgrClientNodeV2, clientReg)
+	srv := registerOnServerV2(t, sB, mgrServerNodeV2, serverReg)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, clientReg)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, serverReg)
+
+	alloc := createAllocatedV2(t, client, mgrServerNodeV2)
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := requestV2Wait(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, IdentityV2{
+		SessionID:    alloc.SessionID,
+		ConnectionID: "conn-1",
+	}, 0), 5*time.Second)
+	connAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, open.Data)
+	if err != nil {
+		t.Fatalf("OPEN conn-1: %v body=%s", err, open.Data)
+	}
+	_, before := waitSessionOwnerV2(t, alloc.SessionID, managers...)
+	ident := IdentityV2{SessionID: connAlloc.Allocated.SessionID, ConnectionID: connAlloc.Allocated.ConnectionID, Epoch: connAlloc.Allocated.Epoch}
+	reqID := mustUUIDV2(t)
+	reply := requestV2Wait(t, client, connSubj, connCmdFrameV2(t, reqID, ConnectionCommandRejectV2, ident, connAlloc.Allocated.Revision), 5*time.Second)
+	if !bytesContainsOK(reply.Data) {
+		t.Fatalf("REJECT reply must be OK: %s", reply.Data)
+	}
+	cClose := nextEventV2(t, clientEv, FrameKindCloseV2)
+	sClose := nextEventV2(t, serverEv, FrameKindCloseV2)
+	if cClose.Close.Revision != before+1 || sClose.Close.Revision != cClose.Close.Revision {
+		t.Fatalf("CLOSE revision client=%d server=%d before=%d", cClose.Close.Revision, sClose.Close.Revision, before)
+	}
+	owner, rev := waitSessionOwnerV2(t, alloc.SessionID, managers...)
+	if rev != cClose.Close.Revision {
+		t.Fatalf("synced revision=%d CLOSE revision=%d", rev, cClose.Close.Revision)
+	}
+	if managerByID(owner, managers...) == nil {
+		t.Fatalf("owner %s missing", owner)
+	}
+	for _, m := range managers {
+		snap, ok := m.v2.store.PeekSession(alloc.SessionID)
+		if !ok || snap.Revision != rev {
+			t.Fatalf("manager %s replica revision ok=%v snapshot=%+v want=%d", m.serverID, ok, snap, rev)
+		}
+		m.v2.store.mu.Lock()
+		conn := m.v2.store.sessions[alloc.SessionID].connections[ident.ConnectionID]
+		var state ConnectionStateV2
+		if conn != nil {
+			state = conn.state
+		}
+		m.v2.store.mu.Unlock()
+		if state != ConnectionStateClosedV2 {
+			t.Fatalf("manager %s replica connection state=%s want closed", m.serverID, state)
+		}
+	}
+
+	repeat := requestV2Wait(t, client, connSubj, connCmdFrameV2(t, reqID, ConnectionCommandRejectV2, ident, alloc.Revision), 5*time.Second)
+	if !bytesContainsOK(repeat.Data) {
+		t.Fatalf("duplicate REJECT reply must be OK: %s", repeat.Data)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+}
+
+func TestClusterV2_ConnectionRejectSyncFailureRepliesBusy(t *testing.T) {
+	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
+	managers := []*Manager{mA, mB, mC}
+	clientReg := newRegistrationIDV2(t)
+	serverReg := newRegistrationIDV2(t)
+	client := registerOnServerV2(t, sA, mgrClientNodeV2, clientReg)
+	srv := registerOnServerV2(t, sB, mgrServerNodeV2, serverReg)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, clientReg)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, serverReg)
+
+	alloc := createAllocatedV2(t, client, mgrServerNodeV2)
+	_, _ = waitSessionOwnerV2(t, alloc.SessionID, managers...)
+	v2TestFailSessionSync.Store(true)
+	t.Cleanup(func() { v2TestFailSessionSync.Store(false) })
+
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqID := mustUUIDV2(t)
+	busy := requestV2Wait(t, client, connSubj, connCmdFrameV2(t, reqID, ConnectionCommandRejectV2, ident, alloc.Revision), 5*time.Second)
+	perr := mustErrorV2(t, busy.Data)
+	if perr.Code != ErrBusyV2 || perr.RetryAfterMs == nil || *perr.RetryAfterMs <= 0 {
+		t.Fatalf("REJECT sync timeout want busy+retry: %+v body=%s", perr, busy.Data)
+	}
+	_ = nextEventV2(t, clientEv, FrameKindCloseV2)
+	_ = nextEventV2(t, serverEv, FrameKindCloseV2)
+}
+
+func TestClusterV2_ConnectionRejectLateJoinKeepsAllConnections(t *testing.T) {
+	sA, sB, sC := startClusterTriple(t)
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mB.Stop)
+	waitClusterPeersN(t, 2, mA, mB)
+
+	client := registerOnServerV2(t, sA, mgrClientNodeV2, newRegistrationIDV2(t))
+	_ = registerOnServerV2(t, sB, mgrServerNodeV2, newRegistrationIDV2(t))
+	alloc := createAllocatedV2(t, client, mgrServerNodeV2)
+	connSubj, err := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := requestV2Wait(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandOpenV2, IdentityV2{
+		SessionID:    alloc.SessionID,
+		ConnectionID: "conn-1",
+	}, 0), 5*time.Second)
+	connAlloc, err := DecodeFrameV2(FrameKindAllocatedV2, open.Data)
+	if err != nil {
+		t.Fatalf("OPEN conn-1: %v body=%s", err, open.Data)
+	}
+	ident := IdentityV2{SessionID: connAlloc.Allocated.SessionID, ConnectionID: connAlloc.Allocated.ConnectionID, Epoch: connAlloc.Allocated.Epoch}
+	reject := requestV2Wait(t, client, connSubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandRejectV2, ident, connAlloc.Allocated.Revision), 5*time.Second)
+	if !bytesContainsOK(reject.Data) {
+		t.Fatalf("REJECT conn-1: %s", reject.Data)
+	}
+	_, revision := waitSessionOwnerV2(t, alloc.SessionID, mA, mB)
+
+	mC, err := StartManager(sC, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mC.Stop)
+	waitClusterPeersN(t, 3, mA, mB, mC)
+	_, gotRevision := waitSessionOwnerV2(t, alloc.SessionID, mA, mB, mC)
+	if gotRevision != revision {
+		t.Fatalf("late join revision=%d want %d", gotRevision, revision)
+	}
+	conn0, ok := mC.v2.store.PeekConnection(alloc.SessionID, "conn-0")
+	if !ok || conn0.State != ConnectionStateAllocatedV2 || conn0.Revision != revision {
+		t.Fatalf("late join conn-0 ok=%v snapshot=%+v want allocated rev=%d", ok, conn0, revision)
+	}
+	conn1, ok := mC.v2.store.PeekConnection(alloc.SessionID, "conn-1")
+	if !ok || conn1.State != ConnectionStateClosedV2 || conn1.Revision != revision {
+		t.Fatalf("late join conn-1 ok=%v snapshot=%+v want closed rev=%d", ok, conn1, revision)
+	}
+}
+
 func bytesContainsOK(data []byte) bool {
 	return strings.Contains(string(data), `"ok":true`)
 }
