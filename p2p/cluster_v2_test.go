@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1243,6 +1245,104 @@ func TestClusterV2_DeliveryLedgerSnapshotDoesNotRevivePublished(t *testing.T) {
 	if pending := lateReplica.PendingEvents(storeClientNodeV2, cmd.RequestID); len(pending) != 0 {
 		t.Fatalf("late join kept stale peer deliveries after current snapshot: %+v", pending)
 	}
+}
+
+func TestClusterV2_DeliveryConfirmedBeforeNextPublish(t *testing.T) {
+	sA, sB, _, mA, mB, mC := startClusterTripleManagers(t)
+	managers := []*Manager{mA, mB, mC}
+	clientReg := newRegistrationIDV2(t)
+	serverReg := newRegistrationIDV2(t)
+	client := registerOnServerV2(t, sA, mgrClientNodeV2, clientReg)
+	srv := registerOnServerV2(t, sB, mgrServerNodeV2, serverReg)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, clientReg)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, serverReg)
+	alloc := createAllocatedV2(t, client, mgrServerNodeV2)
+	owner, _ := waitSessionOwnerV2(t, alloc.SessionID, managers...)
+
+	reqID := mustUUIDV2(t)
+	ident := IdentityV2{SessionID: alloc.SessionID, ConnectionID: alloc.ConnectionID, Epoch: alloc.Epoch}
+	bindSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := sessionCmdFrameV2(t, reqID, SessionCommandBindV2, ident, alloc.Revision)
+	secondEntered := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var attemptsMu sync.Mutex
+	var attempts []string
+	v2TestPublishHook = func(_ string, data []byte) error {
+		var env EnvelopeV2
+		if err := json.Unmarshal(data, &env); err != nil {
+			return err
+		}
+		attemptsMu.Lock()
+		attempts = append(attempts, env.MessageID)
+		attempt := len(attempts)
+		attemptsMu.Unlock()
+		if attempt == 2 {
+			close(secondEntered)
+			<-releaseSecond
+			return errors.New("injected second publish failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { v2TestPublishHook = nil })
+	replyCh := make(chan *nats.Msg, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		reply, err := client.Request(bindSubj, frame, 5*time.Second)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		replyCh <- reply
+	}()
+	select {
+	case <-secondEntered:
+	case <-time.After(3 * time.Second):
+		close(releaseSecond)
+		t.Fatal("second publish did not block")
+	}
+
+	for _, manager := range managers {
+		pending := manager.v2.store.PendingEvents(mgrClientNodeV2, reqID)
+		if len(pending) != 1 {
+			close(releaseSecond)
+			t.Fatalf("manager %s pending while second publish blocked=%+v want one", manager.serverID, pending)
+		}
+	}
+	first := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	close(releaseSecond)
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case reply := <-replyCh:
+		if perr := mustErrorV2(t, reply.Data); perr.Code != ErrBusyV2 {
+			t.Fatalf("blocked owner reply=%+v body=%s", perr, reply.Data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked owner request did not complete")
+	}
+
+	takeover := mA
+	if takeover.serverID == owner {
+		takeover = mB
+	}
+	if takeover.serverID == owner {
+		takeover = mC
+	}
+	if err := takeover.publishRequestEventsV2(mgrClientNodeV2, reqID); err != nil {
+		t.Fatal(err)
+	}
+	second := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	attemptsMu.Lock()
+	gotAttempts := append([]string(nil), attempts...)
+	attemptsMu.Unlock()
+	if len(gotAttempts) != 3 || gotAttempts[0] != first.Envelope.MessageID || gotAttempts[1] != gotAttempts[2] || gotAttempts[2] != second.Envelope.MessageID {
+		t.Fatalf("takeover attempts=%v first=%s second=%s", gotAttempts, first.Envelope.MessageID, second.Envelope.MessageID)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
 }
 
 func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {

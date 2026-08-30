@@ -1177,6 +1177,212 @@ func TestManagerV2_ConcurrentPublishRetrySerializesDelivery(t *testing.T) {
 	assertNoEventV2(t, serverEv)
 }
 
+func TestManagerV2_DeliveryLockShardsBoundedAndIndependent(t *testing.T) {
+	m := &Manager{v2: &managerV2{}}
+	if got := len(m.v2.deliveryLocks); got != v2DeliveryLockShards {
+		t.Fatalf("delivery lock shards=%d want %d", got, v2DeliveryLockShards)
+	}
+	sender := mgrClientNodeV2
+	requestA := mustUUIDV2(t)
+	requestB := mustUUIDV2(t)
+	for deliveryLockShardV2(sender, requestB) == deliveryLockShardV2(sender, requestA) {
+		requestB = mustUUIDV2(t)
+	}
+
+	releaseA := m.lockDeliveryV2(sender, requestA)
+	sameEntered := make(chan struct{})
+	sameRelease := make(chan struct{})
+	go func() {
+		unlock := m.lockDeliveryV2(sender, requestA)
+		close(sameEntered)
+		<-sameRelease
+		unlock()
+	}()
+	select {
+	case <-sameEntered:
+		releaseA()
+		close(sameRelease)
+		t.Fatal("same request acquired delivery lock concurrently")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	otherEntered := make(chan struct{})
+	go func() {
+		unlock := m.lockDeliveryV2(sender, requestB)
+		unlock()
+		close(otherEntered)
+	}()
+	select {
+	case <-otherEntered:
+	case <-time.After(time.Second):
+		releaseA()
+		close(sameRelease)
+		t.Fatal("different request on another shard was blocked")
+	}
+	releaseA()
+	select {
+	case <-sameEntered:
+		close(sameRelease)
+	case <-time.After(time.Second):
+		close(sameRelease)
+		t.Fatal("same request did not acquire after release")
+	}
+
+	for i := 0; i < 10_000; i++ {
+		unlock := m.lockDeliveryV2(fmt.Sprintf("node-%d", i), fmt.Sprintf("request-%d", i))
+		unlock()
+	}
+	if got := len(m.v2.deliveryLocks); got != v2DeliveryLockShards {
+		t.Fatalf("delivery lock shards grew after churn: %d", got)
+	}
+}
+
+func TestManagerV2_StateReplayDoesNotDoubleCountMetrics(t *testing.T) {
+	s, mgr := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	created := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, created.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+	stat := func(state ConnectionStateV2) int64 {
+		mgr.v2.stats.connMu.Lock()
+		defer mgr.v2.stats.connMu.Unlock()
+		return mgr.v2.stats.conns[string(state)+"|owner"]
+	}
+
+	bindReq := mustUUIDV2(t)
+	bindSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	bindFrame := sessionCmdFrameV2(t, bindReq, SessionCommandBindV2, ident, alloc.Allocated.Revision)
+	if reply := requestV2(t, client, bindSubj, bindFrame); !bytesContainsOK(reply.Data) {
+		t.Fatalf("BIND reply: %s", reply.Data)
+	}
+	cPrep := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	sPrep := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	allocatedAfterBind := stat(ConnectionStateAllocatedV2)
+	preparingAfterBind := stat(ConnectionStatePreparingV2)
+	for i := 0; i < 2; i++ {
+		if reply := requestV2(t, client, bindSubj, bindFrame); !bytesContainsOK(reply.Data) {
+			t.Fatalf("BIND replay %d: %s", i+1, reply.Data)
+		}
+	}
+	if got := stat(ConnectionStatePreparingV2); got != preparingAfterBind {
+		t.Fatalf("BIND replay changed preparing metric %d -> %d", preparingAfterBind, got)
+	}
+	if got := stat(ConnectionStateAllocatedV2); got != allocatedAfterBind {
+		t.Fatalf("BIND replay changed allocated metric %d -> %d", allocatedAfterBind, got)
+	}
+
+	clientReadySubj, _ := CommandSubjectV2(mgrClientNodeV2, "CONNECTION.COMMAND")
+	serverReadySubj, _ := CommandSubjectV2(mgrServerNodeV2, "CONNECTION.COMMAND")
+	if reply := requestV2(t, client, clientReadySubj, connCmdFrameV2(t, mustUUIDV2(t), ConnectionCommandReadyV2, ident, cPrep.Prepare.Revision)); !bytesContainsOK(reply.Data) {
+		t.Fatalf("client READY: %s", reply.Data)
+	}
+	readyReq := mustUUIDV2(t)
+	readyFrame := connCmdFrameV2(t, readyReq, ConnectionCommandReadyV2, ident, sPrep.Prepare.Revision)
+	if reply := requestV2(t, srv, serverReadySubj, readyFrame); !bytesContainsOK(reply.Data) {
+		t.Fatalf("server READY: %s", reply.Data)
+	}
+	_ = nextEventV2(t, clientEv, FrameKindStartV2)
+	_ = nextEventV2(t, serverEv, FrameKindStartV2)
+	preparingAfterStart := stat(ConnectionStatePreparingV2)
+	activeAfterStart := stat(ConnectionStateActiveV2)
+	for i := 0; i < 2; i++ {
+		if reply := requestV2(t, srv, serverReadySubj, readyFrame); !bytesContainsOK(reply.Data) {
+			t.Fatalf("READY replay %d: %s", i+1, reply.Data)
+		}
+	}
+	if got := stat(ConnectionStatePreparingV2); got != preparingAfterStart {
+		t.Fatalf("READY replay changed preparing metric %d -> %d", preparingAfterStart, got)
+	}
+	if got := stat(ConnectionStateActiveV2); got != activeAfterStart {
+		t.Fatalf("READY replay changed active metric %d -> %d", activeAfterStart, got)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+}
+
+func TestManagerV2_DeliverySyncFailureStopsPublishLoop(t *testing.T) {
+	s, mgr := startManagerV2(t, Config{})
+	client := agentConn(t, s, mgrClientNodeV2)
+	srv := agentConn(t, s, mgrServerNodeV2)
+	clientEv := subscribeEventsV2(t, client, mgrClientNodeV2, mgrClientRegV2)
+	serverEv := subscribeEventsV2(t, srv, mgrServerNodeV2, mgrServerRegV2)
+	mustRegisterV2(t, client, s.ID(), mgrClientNodeV2, mgrClientRegV2)
+	mustRegisterV2(t, srv, s.ID(), mgrServerNodeV2, mgrServerRegV2)
+	createSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
+	created := requestV2(t, client, createSubj, createFrameV2(t, mustUUIDV2(t), mgrServerNodeV2))
+	alloc, err := DecodeFrameV2(FrameKindAllocatedV2, created.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident := IdentityV2{SessionID: alloc.Allocated.SessionID, ConnectionID: alloc.Allocated.ConnectionID, Epoch: alloc.Allocated.Epoch}
+	stat := func(state ConnectionStateV2) int64 {
+		mgr.v2.stats.connMu.Lock()
+		defer mgr.v2.stats.connMu.Unlock()
+		return mgr.v2.stats.conns[string(state)+"|owner"]
+	}
+	reqID := mustUUIDV2(t)
+	bindSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
+	frame := sessionCmdFrameV2(t, reqID, SessionCommandBindV2, ident, alloc.Allocated.Revision)
+	var attempts atomic.Int32
+	v2TestPublishHook = func(_ string, _ []byte) error {
+		attempts.Add(1)
+		return nil
+	}
+	v2TestFailDeliverySync.Store(true)
+	t.Cleanup(func() {
+		v2TestPublishHook = nil
+		v2TestFailDeliverySync.Store(false)
+	})
+
+	first := requestV2(t, client, bindSubj, frame)
+	if perr := mustErrorV2(t, first.Data); perr.Code != ErrBusyV2 {
+		t.Fatalf("delivery sync failure reply=%+v body=%s", perr, first.Data)
+	}
+	if got := stat(ConnectionStateAllocatedV2); got != 0 {
+		t.Fatalf("first BIND state transition left allocated metric=%d want 0", got)
+	}
+	if got := stat(ConnectionStatePreparingV2); got != 1 {
+		t.Fatalf("first BIND state transition preparing metric=%d want 1", got)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("delivery sync failure allowed later publish: attempts=%d", got)
+	}
+	firstEvent := nextEventV2(t, clientEv, FrameKindPrepareV2)
+	if pending := mgr.v2.store.PendingEvents(mgrClientNodeV2, reqID); len(pending) != 1 {
+		t.Fatalf("delivery sync failure pending=%+v want one", pending)
+	}
+
+	v2TestFailDeliverySync.Store(false)
+	retry := requestV2(t, client, bindSubj, frame)
+	if !bytesContainsOK(retry.Data) {
+		t.Fatalf("retry after delivery sync recovery: %s", retry.Data)
+	}
+	secondEvent := nextEventV2(t, serverEv, FrameKindPrepareV2)
+	if firstEvent.Envelope.MessageID == secondEvent.Envelope.MessageID {
+		t.Fatalf("distinct targets reused message ID %s", firstEvent.Envelope.MessageID)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("retry attempts=%d want two total", got)
+	}
+	if got := stat(ConnectionStateAllocatedV2); got != 0 {
+		t.Fatalf("retry changed allocated metric to %d", got)
+	}
+	if got := stat(ConnectionStatePreparingV2); got != 1 {
+		t.Fatalf("retry changed preparing metric to %d", got)
+	}
+	assertNoEventV2(t, clientEv)
+	assertNoEventV2(t, serverEv)
+}
+
 func TestManagerV2_ConnectionRejectSyncReleasesSessionLock(t *testing.T) {
 	s, _ := startManagerV2(t, Config{})
 	client := agentConn(t, s, mgrClientNodeV2)

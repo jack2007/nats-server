@@ -795,6 +795,9 @@ func (m *Manager) syncMutationV2(mut v2MgrMutation) error {
 	if !m.applyMutationV2(mut) {
 		return errors.New("local apply rejected")
 	}
+	if v2TestFailDeliverySync.Load() && mut.Kind == v2MutationDelivery {
+		return errV2SyncTimeout
+	}
 	if v2TestFailSessionSync.Load() && mut.Kind == v2MutationSession {
 		return errV2SyncTimeout
 	}
@@ -980,7 +983,18 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 	}
 	m.v2.mu.Unlock()
 	for i := range sessions {
-		sessions[i].Requests = m.v2.store.requestSnapshotsV2(sessions[i].SessionID)
+		storeSnapshot, ok := m.v2.store.SyncSnapshotV2(sessions[i].SessionID)
+		if ok {
+			sessions[i].Revision = storeSnapshot.Session.Revision
+			sessions[i].ClientNodeKey = storeSnapshot.Session.ClientNodeKey
+			sessions[i].ServerNodeKey = storeSnapshot.Session.ServerNodeKey
+			sessions[i].State = string(storeSnapshot.Session.State)
+			sessions[i].ConnectionID = storeSnapshot.Session.ConnectionID
+			sessions[i].ConnectionState = string(storeSnapshot.Session.ConnectionState)
+			sessions[i].Epoch = storeSnapshot.Session.Epoch
+			sessions[i].Connections = v2ConnectionSnapshotsFromStore(storeSnapshot.Connections)
+			sessions[i].Requests = storeSnapshot.Requests
+		}
 		id := snapshotSessionMutationIDV2(sessions[i].Sender, sessions[i].SessionID, sessions[i].Revision, sessions[i].Requests)
 		sessions[i].MutationID = id
 		sessions[i].MessageID = id
@@ -1248,19 +1262,15 @@ func (m *Manager) handleDisconnectV2(msg *nats.Msg) {
 }
 
 func (m *Manager) syncSessionLockedV2(sessionID, requestID, sender string) error {
-	snap, ok := m.v2.store.PeekSession(sessionID)
+	storeSnapshot, ok := m.v2.store.SyncSnapshotV2(sessionID)
 	if !ok {
 		return nil
 	}
-	connections, ok := m.v2.store.PeekConnections(sessionID)
-	if !ok {
-		return nil
-	}
-	return m.syncSessionConnectionsV2(snap, connections, requestID, sender)
+	return m.syncSessionSnapshotV2(storeSnapshot, requestID, sender)
 }
 
-func (m *Manager) syncSessionConnectionsV2(snap SessionSnapshotV2, connections []ConnectionSnapshotV2, requestID, sender string) error {
-	requests := m.v2.store.requestSnapshotsV2(snap.SessionID)
+func (m *Manager) syncSessionSnapshotV2(storeSnapshot StoreSyncSnapshotV2, requestID, sender string) error {
+	snap := storeSnapshot.Session
 	m.v2.mu.Lock()
 	meta := m.v2.owners[snap.SessionID]
 	if meta == nil {
@@ -1274,7 +1284,7 @@ func (m *Manager) syncSessionConnectionsV2(snap SessionSnapshotV2, connections [
 	meta.ConnectionID = snap.ConnectionID
 	meta.ConnectionState = snap.ConnectionState
 	meta.Epoch = snap.Epoch
-	meta.Connections = v2ConnectionSnapshotsFromStore(connections)
+	meta.Connections = v2ConnectionSnapshotsFromStore(storeSnapshot.Connections)
 	if requestID != "" && meta.RequestID == "" {
 		meta.RequestID = requestID
 	}
@@ -1295,7 +1305,7 @@ func (m *Manager) syncSessionConnectionsV2(snap SessionSnapshotV2, connections [
 		Connections:     cloneV2ConnectionSnapshots(meta.Connections),
 		Epoch:           meta.Epoch,
 		SetupTimeoutMs:  meta.SetupTimeoutMs,
-		Requests:        requests,
+		Requests:        storeSnapshot.Requests,
 	}
 	m.v2.mu.Unlock()
 	return m.syncMutationV2(mut)

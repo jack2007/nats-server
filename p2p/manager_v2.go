@@ -15,14 +15,15 @@ import (
 )
 
 const (
-	FeatureBitsV2       uint64 = 1
-	RetryInitialV2             = 100 * time.Millisecond
-	RetryMaxV2                 = time.Second
-	v2CoordinatorQueue         = "$P2P.V2.COORDINATORS"
-	v2CoordinatorSender        = "coordinator"
-	v2DefaultCmdQueue          = 64
-	v2DefaultWorkers           = 8
-	v2MaxConnections           = 128
+	FeatureBitsV2        uint64 = 1
+	RetryInitialV2              = 100 * time.Millisecond
+	RetryMaxV2                  = time.Second
+	v2CoordinatorQueue          = "$P2P.V2.COORDINATORS"
+	v2CoordinatorSender         = "coordinator"
+	v2DefaultCmdQueue           = 64
+	v2DefaultWorkers            = 8
+	v2MaxConnections            = 128
+	v2DeliveryLockShards        = 64
 )
 
 var (
@@ -40,6 +41,7 @@ var (
 	v2TestDropSessionSync     bool
 	v2TestDropSessionSyncNode string
 	v2TestFailSessionSync     atomic.Bool
+	v2TestFailDeliverySync    atomic.Bool
 	v2TestSessionSyncGate     atomic.Value
 )
 
@@ -83,7 +85,7 @@ type managerV2 struct {
 	joinedQueue     bool
 	unreachable     bool
 	sessionMu       sync.Map
-	deliveryMu      sync.Map
+	deliveryLocks   [v2DeliveryLockShards]sync.Mutex
 	retryMu         sync.Mutex
 	retries         map[MessageKeyV2]signalRetryItemV2
 	retryWake       chan struct{}
@@ -468,6 +470,7 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 	deliveryUnlock := m.lockDeliveryV2(sender, cmd.RequestID)
 	defer deliveryUnlock()
 	unlock := m.lockSessionV2(cmd.SessionID)
+	replayed := m.v2.store.HasStateRequest(sender, cmd.RequestID)
 	_, err = m.v2.store.BindSession(sender, cmd)
 	if err != nil {
 		unlock()
@@ -480,6 +483,10 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 	if cmd.Command == SessionCommandCloseV2 {
 		m.dropSignalRetriesForSessionV2(cmd.SessionID)
 	}
+	if cmd.Command == SessionCommandBindV2 && !replayed {
+		m.v2.stats.noteConn(string(ConnectionStateAllocatedV2), "owner", -1)
+		m.v2.stats.noteConn(string(ConnectionStatePreparingV2), "owner", 1)
+	}
 	unlock()
 	publishErr := m.publishRequestEventsV2(sender, cmd.RequestID)
 	stateSyncErr := m.syncSessionLockedV2(cmd.SessionID, cmd.RequestID, sender)
@@ -488,10 +495,6 @@ func (m *Manager) handleSessionV2(msg *nats.Msg, sender string) {
 		m.noteRevisionSyncV2(stateSyncErr)
 		m.replyStateBusyV2(msg, cmd.RequestID)
 		return
-	}
-	if cmd.Command == SessionCommandBindV2 {
-		m.v2.stats.noteConn(string(ConnectionStateAllocatedV2), "owner", -1)
-		m.v2.stats.noteConn(string(ConnectionStatePreparingV2), "owner", 1)
 	}
 	m.noteRevisionSyncV2(nil)
 	m.replyV2OK(msg, cmd.RequestID)
@@ -553,6 +556,7 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 		locked = false
 		m.finishConnectionStateCommandV2(msg, sender, cmd)
 	case ConnectionCommandReadyV2:
+		replayed := m.v2.store.HasStateRequest(sender, cmd.RequestID)
 		events, err := m.v2.store.MarkConnectionReady(sender, cmd)
 		if err != nil {
 			if m.replyIfClosedV2(msg, cmd.RequestID, cmd.IdentityV2) {
@@ -561,11 +565,13 @@ func (m *Manager) handleConnectionV2(msg *nats.Msg, sender string) {
 			m.replyV2Error(msg, cmd.RequestID, protocolCodeV2(err), nil)
 			return
 		}
-		for _, ev := range events {
-			if ev.Kind == FrameKindStartV2 {
-				m.v2.stats.noteConn(string(ConnectionStatePreparingV2), "owner", -1)
-				m.v2.stats.noteConn(string(ConnectionStateActiveV2), "owner", 1)
-				break
+		if !replayed {
+			for _, ev := range events {
+				if ev.Kind == FrameKindStartV2 {
+					m.v2.stats.noteConn(string(ConnectionStatePreparingV2), "owner", -1)
+					m.v2.stats.noteConn(string(ConnectionStateActiveV2), "owner", 1)
+					break
+				}
 			}
 		}
 		unlock()
@@ -873,8 +879,6 @@ func (m *Manager) publishRequestEventsV2(sender, requestID string) error {
 			break
 		}
 	}
-	published := make([]string, 0, len(events))
-	var publishErr error
 	for _, event := range events {
 		if event.Kind == FrameKindPrepareV2 && event.Prepare != nil {
 			prepare := *event.Prepare
@@ -882,15 +886,16 @@ func (m *Manager) publishRequestEventsV2(sender, requestID string) error {
 			event.Prepare = &prepare
 		}
 		if err := m.publishV2Event(event.TargetNodeKey, event); err != nil {
-			publishErr = err
-			break
+			return err
 		}
-		published = append(published, event.MessageID)
+		if err := m.v2.store.MarkEventsPublished(sender, requestID, []string{event.MessageID}); err != nil {
+			return err
+		}
+		if err := m.syncRequestDeliveriesV2(event.Identity.SessionID); err != nil {
+			return err
+		}
 	}
-	if err := m.v2.store.MarkEventsPublished(sender, requestID, published); err != nil {
-		return err
-	}
-	return publishErr
+	return nil
 }
 
 func (m *Manager) publishPrepareV2(events []EventV2) error {
@@ -1108,11 +1113,26 @@ func (m *Manager) lockSessionV2(sessionID string) func() {
 }
 
 func (m *Manager) lockDeliveryV2(sender, requestID string) func() {
-	key := RequestKeyV2{SenderNodeKey: sender, RequestID: requestID}
-	v, _ := m.v2.deliveryMu.LoadOrStore(key, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
+	mu := &m.v2.deliveryLocks[deliveryLockShardV2(sender, requestID)]
 	mu.Lock()
 	return mu.Unlock
+}
+
+func deliveryLockShardV2(sender, requestID string) int {
+	const offset32 = uint32(2166136261)
+	const prime32 = uint32(16777619)
+	hash := offset32
+	for i := 0; i < len(sender); i++ {
+		hash ^= uint32(sender[i])
+		hash *= prime32
+	}
+	hash ^= 0
+	hash *= prime32
+	for i := 0; i < len(requestID); i++ {
+		hash ^= uint32(requestID[i])
+		hash *= prime32
+	}
+	return int(hash % v2DeliveryLockShards)
 }
 
 func (m *Manager) replyAllocatedV2(msg *nats.Msg, requestID string, snap ConnectionSnapshotV2) {

@@ -16,6 +16,8 @@ const (
 	FrameKindCloseV2           FrameKindV2       = "CLOSE"
 )
 
+var v2TestStoreSyncSnapshotHook func()
+
 type GenerationKeyV2 struct {
 	SessionID, ConnectionID string
 	Epoch                   uint64
@@ -58,6 +60,12 @@ type ConnectionSnapshotV2 struct {
 	Epoch        uint64
 	State        ConnectionStateV2
 	Revision     uint64
+}
+
+type StoreSyncSnapshotV2 struct {
+	Session     SessionSnapshotV2
+	Connections []ConnectionSnapshotV2
+	Requests    []v2RequestSnapshot
 }
 
 type EventV2 struct {
@@ -543,6 +551,13 @@ func (s *StoreV2) PendingEvents(sender, requestID string) []EventV2 {
 	return cloneEventsV2(rec.pending)
 }
 
+func (s *StoreV2) HasStateRequest(sender, requestID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.requests[RequestKeyV2{SenderNodeKey: sender, RequestID: requestID}]
+	return ok && rec.hasEv
+}
+
 // MarkEventsPublished confirms only the supplied message IDs and leaves every
 // other delivery pending for a retry of the same request.
 func (s *StoreV2) MarkEventsPublished(sender, requestID string, messageIDs []string) error {
@@ -589,6 +604,10 @@ func (s *StoreV2) MarkEventsPublished(sender, requestID string, messageIDs []str
 func (s *StoreV2) requestSnapshotsV2(sessionID string) []v2RequestSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.requestSnapshotsLockedV2(sessionID)
+}
+
+func (s *StoreV2) requestSnapshotsLockedV2(sessionID string) []v2RequestSnapshot {
 	requests := make([]v2RequestSnapshot, 0)
 	for key, rec := range s.requests {
 		if rec.sessionID != sessionID {
@@ -617,6 +636,33 @@ func (s *StoreV2) requestSnapshotsV2(sessionID string) []v2RequestSnapshot {
 		return requests[i].RequestID < requests[j].RequestID
 	})
 	return requests
+}
+
+func (s *StoreV2) SyncSnapshotV2(sessionID string) (StoreSyncSnapshotV2, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.sessions[sessionID]
+	if sess == nil {
+		sess = s.tombs[sessionID]
+	}
+	if sess == nil {
+		return StoreSyncSnapshotV2{}, false
+	}
+	snapshot := StoreSyncSnapshotV2{Session: sessionSnapV2(sess)}
+	if v2TestStoreSyncSnapshotHook != nil {
+		v2TestStoreSyncSnapshotHook()
+	}
+	connectionIDs := make([]string, 0, len(sess.connections))
+	for connectionID := range sess.connections {
+		connectionIDs = append(connectionIDs, connectionID)
+	}
+	sort.Strings(connectionIDs)
+	snapshot.Connections = make([]ConnectionSnapshotV2, 0, len(connectionIDs))
+	for _, connectionID := range connectionIDs {
+		snapshot.Connections = append(snapshot.Connections, connSnapV2(sess, sess.connections[connectionID]))
+	}
+	snapshot.Requests = s.requestSnapshotsLockedV2(sessionID)
+	return snapshot, true
 }
 
 func (s *StoreV2) importRequestSnapshotsV2(requests []v2RequestSnapshot) {
@@ -1211,7 +1257,43 @@ func cloneEventsV2(in []EventV2) []EventV2 {
 		return nil
 	}
 	out := make([]EventV2, len(in))
-	copy(out, in)
+	for i, event := range in {
+		out[i] = event
+		if event.Prepare != nil {
+			prepare := *event.Prepare
+			prepare.StunURLs = append([]string(nil), event.Prepare.StunURLs...)
+			if event.Prepare.Turn != nil {
+				turn := *event.Prepare.Turn
+				turn.URLs = append([]string(nil), event.Prepare.Turn.URLs...)
+				prepare.Turn = &turn
+			}
+			out[i].Prepare = &prepare
+		}
+		if event.Start != nil {
+			start := *event.Start
+			out[i].Start = &start
+		}
+		if event.Signal != nil {
+			signal := *event.Signal
+			out[i].Signal = &signal
+		}
+		if event.Error != nil {
+			errorPayload := *event.Error
+			if event.Error.RetryAfterMs != nil {
+				retryAfter := *event.Error.RetryAfterMs
+				errorPayload.RetryAfterMs = &retryAfter
+			}
+			if event.Error.Revision != nil {
+				revision := *event.Error.Revision
+				errorPayload.Revision = &revision
+			}
+			if event.Error.Limit != nil {
+				limit := *event.Error.Limit
+				errorPayload.Limit = &limit
+			}
+			out[i].Error = &errorPayload
+		}
+	}
 	return out
 }
 

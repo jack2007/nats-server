@@ -341,6 +341,84 @@ func TestStoreV2_StateCommandsIdempotentDeliveryLedger(t *testing.T) {
 	}
 }
 
+func TestStoreV2_SyncSnapshotIsSinglePointInTime(t *testing.T) {
+	s, _ := newTestStoreV2(t)
+	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
+	mustRegisterNodeV2(t, s, storeServerNodeV2, storeServerRegV2)
+	createReq := mustUUIDV2(t)
+	session, err := s.AllocateSession(storeClientNodeV2, CreateSessionCommandV2{
+		RequestID:     createReq,
+		ServerNodeKey: storeServerNodeV2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := sessionBindCmdV2(t, session)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	v2TestStoreSyncSnapshotHook = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { v2TestStoreSyncSnapshotHook = nil })
+	type result struct {
+		snapshot StoreSyncSnapshotV2
+		ok       bool
+	}
+	snapshotCh := make(chan result, 1)
+	go func() {
+		snapshot, ok := s.SyncSnapshotV2(session.SessionID)
+		snapshotCh <- result{snapshot: snapshot, ok: ok}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("sync snapshot hook was not reached")
+	}
+
+	bindDone := make(chan error, 1)
+	go func() {
+		_, err := s.BindSession(storeClientNodeV2, bind)
+		bindDone <- err
+	}()
+	select {
+	case err := <-bindDone:
+		close(release)
+		t.Fatalf("BIND completed inside sync snapshot lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	var captured result
+	select {
+	case captured = <-snapshotCh:
+	case <-time.After(time.Second):
+		t.Fatal("sync snapshot did not complete")
+	}
+	if !captured.ok {
+		t.Fatal("sync snapshot missing session")
+	}
+	if err := <-bindDone; err != nil {
+		t.Fatal(err)
+	}
+	if captured.snapshot.Session.Revision != session.Revision || captured.snapshot.Session.State != SessionStateAllocatedV2 {
+		t.Fatalf("session snapshot crossed mutation: %+v", captured.snapshot.Session)
+	}
+	if len(captured.snapshot.Connections) != 1 || captured.snapshot.Connections[0].Revision != session.Revision || captured.snapshot.Connections[0].State != ConnectionStateAllocatedV2 {
+		t.Fatalf("connection snapshot crossed mutation: %+v", captured.snapshot.Connections)
+	}
+	if len(captured.snapshot.Requests) != 1 || captured.snapshot.Requests[0].RequestID != createReq {
+		t.Fatalf("request ledger crossed mutation: %+v", captured.snapshot.Requests)
+	}
+	v2TestStoreSyncSnapshotHook = nil
+	current, ok := s.SyncSnapshotV2(session.SessionID)
+	if !ok || current.Session.Revision <= captured.snapshot.Session.Revision || len(current.Requests) != 2 {
+		t.Fatalf("post-BIND snapshot did not advance: ok=%v snapshot=%+v", ok, current)
+	}
+}
+
 func TestStoreV2_OpenRestartTwoPhase(t *testing.T) {
 	s, _ := newTestStoreV2(t)
 	mustRegisterNodeV2(t, s, storeClientNodeV2, storeClientRegV2)
