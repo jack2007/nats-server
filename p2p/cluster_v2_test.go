@@ -977,6 +977,7 @@ func TestClusterV2_CatchUpRetriesUntilComplete(t *testing.T) {
 	thirdAttempt := make(chan struct{})
 	v2TestCatchUpTimeout = 10 * time.Millisecond
 	v2TestCatchUpRetryDelay = time.Millisecond
+	v2TestInitialUnstableMax = 2
 	v2TestBeforeCatchUp = func(m *Manager) {
 		if m.serverID != sB.ID() {
 			return
@@ -998,6 +999,7 @@ func TestClusterV2_CatchUpRetriesUntilComplete(t *testing.T) {
 		v2TestCatchUpExtraNeed = 0
 		v2TestCatchUpTimeout = 0
 		v2TestCatchUpRetryDelay = 0
+		v2TestInitialUnstableMax = 0
 	})
 
 	mB, err := StartManager(sB, cfg)
@@ -1197,6 +1199,79 @@ func TestClusterV2_FirstCoordinatorJoinsAfterStableEmptyDiscovery(t *testing.T) 
 	case <-m.v2.catchUpDone:
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("first coordinator did not join after stable empty discovery")
+	}
+}
+
+func TestClusterV2_ContinuousMembershipChurnDoesNotBlockStart(t *testing.T) {
+	sA, _ := startClusterPair(t)
+	var churn atomic.Bool
+	churn.Store(true)
+	var round atomic.Int64
+	v2TestCatchUpTimeout = 10 * time.Millisecond
+	v2TestCatchUpRetryDelay = time.Millisecond
+	v2TestBeforeCatchUp = func(m *Manager) {
+		if !churn.Load() || m.serverID != sA.ID() {
+			return
+		}
+		m.v2.catchUpKnown = make(map[string]struct{})
+		m.v2.catchUpKnownSet = false
+		m.peers.mu.Lock()
+		m.peers.lastBeat = make(map[string]time.Time)
+		m.peers.mu.Unlock()
+	}
+	v2TestCatchUpCandidate = func(candidate map[string]struct{}) {
+		if churn.Load() {
+			candidate[fmt.Sprintf("ghost-%d", round.Add(1))] = struct{}{}
+		}
+	}
+	t.Cleanup(func() {
+		v2TestBeforeCatchUp = nil
+		v2TestCatchUpCandidate = nil
+		v2TestCatchUpTimeout = 0
+		v2TestCatchUpRetryDelay = 0
+	})
+	type startResult struct {
+		m   *Manager
+		err error
+	}
+	started := make(chan startResult, 1)
+	go func() {
+		m, err := StartManager(sA, clusterConfig())
+		started <- startResult{m: m, err: err}
+	}()
+	select {
+	case got := <-started:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.m.joinedQueueGroupV2() {
+			t.Fatal("manager joined while membership was continuously unstable")
+		}
+		before := round.Load()
+		deadline := time.Now().Add(100 * time.Millisecond)
+		for round.Load() <= before && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if round.Load() <= before {
+			t.Fatal("catch-up worker did not continue after StartManager returned")
+		}
+		stopped := make(chan struct{})
+		go func() {
+			got.m.Stop()
+			close(stopped)
+		}()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("Stop did not cancel churned catch-up worker")
+		}
+	case <-time.After(250 * time.Millisecond):
+		churn.Store(false)
+		got := <-started
+		if got.m != nil {
+			got.m.Stop()
+		}
+		t.Fatal("StartManager remained blocked by continuous membership churn")
 	}
 }
 

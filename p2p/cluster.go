@@ -805,6 +805,9 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 	aliveAtEnd := m.catchUpPeersV2()
 	candidate := cloneStringSetV2(aliveAtEnd)
 	mergeStringSetV2(candidate, discovered)
+	if hook := v2TestCatchUpCandidate; hook != nil {
+		hook(candidate)
+	}
 	if !m.inCluster() && len(required) == 0 && len(candidate) == 0 && !peerSnap {
 		return nil
 	}

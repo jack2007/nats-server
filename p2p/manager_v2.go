@@ -41,9 +41,11 @@ var (
 	v2TestCatchUpExtraNeed    int
 	v2TestCatchUpTimeout      time.Duration
 	v2TestCatchUpRetryDelay   time.Duration
+	v2TestInitialUnstableMax  int
 	v2TestSnapshotGate        func(string) <-chan struct{}
 	v2TestSnapshotReplied     func(string)
 	v2TestCatchUpSawSender    func(string)
+	v2TestCatchUpCandidate    func(map[string]struct{})
 	v2TestStopExitEntered     chan<- struct{}
 	v2TestStopExitHold        <-chan struct{}
 	v2TestDropSessionSync     bool
@@ -111,6 +113,7 @@ type managerV2 struct {
 	catchUpBackoff  func(int) time.Duration
 	catchUpKnown    map[string]struct{}
 	catchUpKnownSet bool
+	initialMax      int
 	stats           v2Stats
 }
 
@@ -174,6 +177,10 @@ func (m *Manager) startV2() error {
 		delay := v2TestCatchUpRetryDelay
 		catchUpBackoff = func(int) time.Duration { return delay }
 	}
+	initialMaxUnstableRounds := 2
+	if v2TestInitialUnstableMax > 0 {
+		initialMaxUnstableRounds = v2TestInitialUnstableMax
+	}
 	m.v2 = &managerV2{
 		store:          store,
 		cmdQ:           make(chan *nats.Msg, qsize),
@@ -192,6 +199,7 @@ func (m *Manager) startV2() error {
 		catchUpTimeout: catchUpTimeout,
 		catchUpBackoff: catchUpBackoff,
 		catchUpKnown:   make(map[string]struct{}),
+		initialMax:     initialMaxUnstableRounds,
 	}
 	m.v2.ingressCond = sync.NewCond(&m.v2.ingressMu)
 	m.v2.ingressOpen = true
@@ -287,6 +295,7 @@ func (m *Manager) endV2Ingress() {
 func (m *Manager) catchUpLoopV2() {
 	defer m.v2.wg.Done()
 	initial := true
+	initialUnstableRounds := 0
 	caughtUp := false
 	attempt := 0
 	for {
@@ -295,9 +304,16 @@ func (m *Manager) catchUpLoopV2() {
 			err = m.catchUpV2(m.v2.catchUpCtx)
 			caughtUp = err == nil
 		}
-		if initial && !caughtUp && !errors.Is(err, errV2CatchUpUnstable) {
-			close(m.v2.catchUpInitial)
-			initial = false
+		if initial && !caughtUp {
+			releaseInitial := true
+			if errors.Is(err, errV2CatchUpUnstable) {
+				initialUnstableRounds++
+				releaseInitial = initialUnstableRounds >= m.v2.initialMax
+			}
+			if releaseInitial {
+				close(m.v2.catchUpInitial)
+				initial = false
+			}
 		}
 		if caughtUp {
 			if hold := v2TestHoldJoinQueue; hold != nil {
