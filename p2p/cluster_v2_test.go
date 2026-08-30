@@ -1033,20 +1033,320 @@ func TestClusterV2_CatchUpRetriesUntilComplete(t *testing.T) {
 	}
 }
 
-func TestClusterV2_CatchUpRejectsUnknownAndEmptySnapshotSenders(t *testing.T) {
-	alive := map[string]struct{}{"peer-a": {}, "peer-c": {}}
-	for _, sender := range []string{"", "ghost"} {
-		if catchUpSenderExpectedV2(alive, sender) {
-			t.Fatalf("unexpected snapshot sender %q counted toward catch-up", sender)
+func TestClusterV2_CatchUpWaitsForStableDiscoveredMembership(t *testing.T) {
+	sA, sB, sC := startClusterTriple(t)
+	releaseB := make(chan struct{})
+	sawA := make(chan struct{})
+	var gateEnabled atomic.Bool
+	t.Cleanup(func() {
+		select {
+		case <-releaseB:
+		default:
+			close(releaseB)
+		}
+		v2TestSnapshotGate = nil
+		v2TestCatchUpSawSender = nil
+		v2TestBeforeCatchUp = nil
+		v2TestCatchUpTimeout = 0
+		v2TestCatchUpRetryDelay = 0
+	})
+	v2TestSnapshotGate = func(serverID string) <-chan struct{} {
+		if gateEnabled.Load() && serverID == sB.ID() {
+			return releaseB
+		}
+		return nil
+	}
+	v2TestCatchUpSawSender = func(sender string) {
+		if gateEnabled.Load() && sender == sA.ID() {
+			select {
+			case <-sawA:
+			default:
+				close(sawA)
+			}
 		}
 	}
-	for _, sender := range []string{"peer-a", "peer-c"} {
+	v2TestBeforeCatchUp = func(m *Manager) {
+		if !gateEnabled.Load() || m.serverID != sC.ID() {
+			return
+		}
+		m.peers.mu.Lock()
+		m.peers.lastBeat = make(map[string]time.Time)
+		m.peers.mu.Unlock()
+	}
+	v2TestCatchUpTimeout = 200 * time.Millisecond
+	v2TestCatchUpRetryDelay = time.Millisecond
+	cfg := clusterConfig()
+	mA, err := StartManager(sA, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mA.Stop)
+	mB, err := StartManager(sB, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mB.Stop)
+	waitClusterPeersN(t, 2, mA, mB)
+	for _, manager := range []*Manager{mA, mB} {
+		select {
+		case <-manager.v2.catchUpDone:
+		case <-time.After(8 * time.Second):
+			t.Fatal("existing manager did not finish catch-up")
+		}
+	}
+
+	seedNode := func(m *Manager, key string) {
+		m.v2.mu.Lock()
+		m.v2.nodes[key] = &v2NodeBinding{
+			registrationID: newRegistrationIDV2(t),
+			epoch:          1,
+			cid:            1,
+			natsServerID:   m.serverID,
+			requestID:      mustUUIDV2(t),
+		}
+		m.v2.mu.Unlock()
+	}
+	seedNode(mA, "only-a")
+	seedNode(mB, "only-b")
+	seedSession := func(m *Manager, client, server string) string {
+		sessionID := mustUUIDV2(t)
+		m.v2.mu.Lock()
+		m.v2.owners[sessionID] = &v2SessionMeta{
+			SessionID:  sessionID,
+			Owner:      m.serverID,
+			Revision:   1,
+			RequestID:  mustUUIDV2(t),
+			ClientNode: client,
+			ServerNode: server,
+			State:      SessionStateAllocatedV2,
+		}
+		m.v2.mu.Unlock()
+		return sessionID
+	}
+	sessionA := seedSession(mA, "only-a", "server-a")
+	sessionB := seedSession(mB, "only-b", "server-b")
+
+	gateEnabled.Store(true)
+	type startResult struct {
+		m   *Manager
+		err error
+	}
+	started := make(chan startResult, 1)
+	go func() {
+		m, err := StartManager(sC, cfg)
+		started <- startResult{m: m, err: err}
+	}()
+	select {
+	case <-sawA:
+	case <-time.After(time.Second):
+		t.Fatal("C did not receive A snapshot")
+	}
+	var got startResult
+	select {
+	case got = <-started:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		t.Cleanup(got.m.Stop)
+	case <-time.After(time.Second):
+		t.Fatal("StartManager did not return after initial catch-up attempt")
+	}
+	select {
+	case <-got.m.v2.catchUpDone:
+		t.Fatal("C completed catch-up before delayed B snapshot")
+	case <-time.After(75 * time.Millisecond):
+	}
+	close(releaseB)
+	select {
+	case <-got.m.v2.catchUpDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("C did not complete catch-up after B snapshot")
+	}
+	if !got.m.joinedQueueGroupV2() {
+		t.Fatal("C did not join after stable A/B discovery")
+	}
+	got.m.v2.mu.Lock()
+	_, haveA := got.m.v2.nodes["only-a"]
+	_, haveB := got.m.v2.nodes["only-b"]
+	got.m.v2.mu.Unlock()
+	if !haveA || !haveB {
+		t.Fatalf("C joined without both snapshots: A=%v B=%v", haveA, haveB)
+	}
+	if _, _, ok := got.m.SessionOwnerV2(sessionA); !ok {
+		t.Fatal("C snapshot missing A session")
+	}
+	if _, _, ok := got.m.SessionOwnerV2(sessionB); !ok {
+		t.Fatal("C snapshot missing B session")
+	}
+}
+
+func TestClusterV2_FirstCoordinatorJoinsAfterStableEmptyDiscovery(t *testing.T) {
+	sA, _ := startClusterPair(t)
+	v2TestCatchUpTimeout = 10 * time.Millisecond
+	v2TestCatchUpRetryDelay = time.Millisecond
+	t.Cleanup(func() {
+		v2TestCatchUpTimeout = 0
+		v2TestCatchUpRetryDelay = 0
+	})
+	m, err := StartManager(sA, clusterConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	select {
+	case <-m.v2.catchUpDone:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("first coordinator did not join after stable empty discovery")
+	}
+}
+
+func TestClusterV2_NodeSnapshotMutationTracksBindingState(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	base := v2MgrMutation{
+		Kind:              v2MutationRegister,
+		Sender:            "peer-a",
+		NodeKey:           "node-a",
+		RegistrationID:    newRegistrationIDV2(t),
+		RegistrationEpoch: 1,
+		CID:               7,
+		NatsServerID:      "peer-a",
+		RequestID:         mustUUIDV2(t),
+		Pending:           true,
+	}
+	base.MutationID = snapshotNodeMutationIDV2(base)
+	base.MessageID = base.MutationID
+	current := base
+	current.Pending = false
+	current.MutationID = snapshotNodeMutationIDV2(current)
+	current.MessageID = current.MutationID
+	if base.MutationID == current.MutationID {
+		t.Fatal("pending and final node snapshots share mutation id")
+	}
+	if !m.applyMutationV2(base) || !m.applyMutationV2(current) {
+		t.Fatal("node snapshot state transition rejected")
+	}
+	m.v2.mu.Lock()
+	binding := m.v2.nodes[base.NodeKey]
+	m.v2.mu.Unlock()
+	if binding == nil || binding.pending {
+		t.Fatalf("final node snapshot was deduplicated: %+v", binding)
+	}
+	replay := current
+	if got := snapshotNodeMutationIDV2(replay); got != current.MutationID {
+		t.Fatalf("same snapshot content changed id: %s vs %s", got, current.MutationID)
+	}
+	otherSender := current
+	otherSender.Sender = "peer-b"
+	if snapshotNodeMutationIDV2(otherSender) == current.MutationID {
+		t.Fatal("different snapshot senders share mutation id")
+	}
+}
+
+func TestClusterV2_StopClosesRegisterIngressBeforeOwnerExit(t *testing.T) {
+	s := startEmbedded(t)
+	m, err := StartManager(s, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	hold := make(chan struct{})
+	v2TestStopExitEntered = entered
+	v2TestStopExitHold = hold
+	t.Cleanup(func() {
+		select {
+		case <-hold:
+		default:
+			close(hold)
+		}
+		v2TestStopExitEntered = nil
+		v2TestStopExitHold = nil
+	})
+	stopped := make(chan struct{})
+	go func() {
+		m.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not reach owner-exit barrier")
+	}
+	nc := agentConnApp(t, s, "late-register")
+	t.Cleanup(nc.Close)
+	subj, err := RegisterSubjectV2("late-register", s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := requestV2Wait(t, nc, subj, registerFrameV2(t, mustUUIDV2(t), newRegistrationIDV2(t)), time.Second)
+	if perr := mustErrorV2(t, reply.Data); perr.Code != ErrBusyV2 {
+		t.Fatalf("REGISTER during Stop was admitted: %+v body=%s", perr, reply.Data)
+	}
+	close(hold)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not finish after owner-exit release")
+	}
+}
+
+func TestClusterV2_CatchUpRejectsEmptyAndDiscoversUnknownSnapshotSenders(t *testing.T) {
+	alive := map[string]struct{}{"peer-a": {}, "peer-c": {}}
+	if catchUpSenderExpectedV2(alive, "") {
+		t.Fatal("empty snapshot sender counted toward catch-up")
+	}
+	for _, sender := range []string{"peer-a", "peer-c", "new-peer"} {
 		if !catchUpSenderExpectedV2(alive, sender) {
-			t.Fatalf("alive snapshot sender %q rejected", sender)
+			t.Fatalf("non-empty snapshot sender %q rejected from discovery", sender)
 		}
 	}
 	if !catchUpSenderExpectedV2(nil, "new-peer") {
 		t.Fatal("discovering catch-up must accept a non-empty peer when alive set is empty")
+	}
+}
+
+func TestClusterV2_SnapshotMembershipCompatibility(t *testing.T) {
+	var legacy v2SnapshotReply
+	if err := json.Unmarshal([]byte(`{"sender":"peer-a","nodes":[],"sessions":[]}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	discovered := make(map[string]struct{})
+	discoverSnapshotMembersV2(discovered, "self", legacy)
+	if !equalStringSetV2(discovered, map[string]struct{}{"peer-a": {}}) {
+		t.Fatalf("legacy snapshot discovery = %v, want sender only", discovered)
+	}
+
+	discoverSnapshotMembersV2(discovered, "self", v2SnapshotReply{
+		Sender:  "peer-b",
+		Members: []string{"", "self", "peer-b", "ghost"},
+	})
+	want := map[string]struct{}{"peer-a": {}, "peer-b": {}, "ghost": {}}
+	if !equalStringSetV2(discovered, want) {
+		t.Fatalf("member discovery = %v, want %v", discovered, want)
+	}
+
+	// A stale transitive member blocks the current round, but is removed from
+	// the remembered candidate set when no live peer reports it again. The
+	// following stable round can therefore complete.
+	alive := map[string]struct{}{"peer-a": {}}
+	known := map[string]struct{}{"peer-a": {}, "ghost": {}}
+	required := cloneStringSetV2(alive)
+	mergeStringSetV2(required, known)
+	candidate := cloneStringSetV2(alive)
+	seen := map[string]struct{}{"peer-a": {}}
+	if catchUpRoundCompleteV2(true, required, candidate, seen, 0) {
+		t.Fatal("round completed while stale ghost was still required")
+	}
+	known = candidate
+	required = cloneStringSetV2(alive)
+	mergeStringSetV2(required, known)
+	candidate = cloneStringSetV2(alive)
+	if !catchUpRoundCompleteV2(true, required, candidate, seen, 0) {
+		t.Fatal("stable round did not complete after stale ghost converged out")
 	}
 }
 

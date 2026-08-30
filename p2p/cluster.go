@@ -601,6 +601,7 @@ type v2ForwardedCmd struct {
 
 type v2SnapshotReply struct {
 	Sender   string          `json:"sender,omitempty"`
+	Members  []string        `json:"members,omitempty"`
 	Nodes    []v2MgrMutation `json:"nodes"`
 	Sessions []v2MgrMutation `json:"sessions"`
 }
@@ -670,14 +671,57 @@ func (m *Manager) catchUpPeerCountV2() int {
 }
 
 func catchUpSenderExpectedV2(peers map[string]struct{}, sender string) bool {
-	if sender == "" {
+	return sender != ""
+}
+
+func cloneStringSetV2(src map[string]struct{}) map[string]struct{} {
+	dst := make(map[string]struct{}, len(src))
+	for key := range src {
+		dst[key] = struct{}{}
+	}
+	return dst
+}
+
+func mergeStringSetV2(dst, src map[string]struct{}) {
+	for key := range src {
+		dst[key] = struct{}{}
+	}
+}
+
+func equalStringSetV2(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	if len(peers) == 0 {
-		return true
+	for key := range a {
+		if _, ok := b[key]; !ok {
+			return false
+		}
 	}
-	_, ok := peers[sender]
-	return ok
+	return true
+}
+
+func containsStringSetV2(have, need map[string]struct{}) bool {
+	for key := range need {
+		if _, ok := have[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func discoverSnapshotMembersV2(discovered map[string]struct{}, self string, snap v2SnapshotReply) {
+	if snap.Sender != "" && snap.Sender != self {
+		discovered[snap.Sender] = struct{}{}
+	}
+	for _, member := range snap.Members {
+		if member != "" && member != self {
+			discovered[member] = struct{}{}
+		}
+	}
+}
+
+func catchUpRoundCompleteV2(knownSet bool, required, candidate, seen map[string]struct{}, extra int) bool {
+	return extra == 0 && knownSet && equalStringSetV2(required, candidate) && containsStringSetV2(seen, required)
 }
 
 func (m *Manager) applySnapshotReplyV2(snap v2SnapshotReply) {
@@ -710,7 +754,11 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 	if err := nc.PublishRequest(subjectV2MgrSnapshot, inbox, []byte(m.serverID)); err != nil {
 		return err
 	}
-	expected := m.catchUpPeersV2()
+	aliveAtStart := m.catchUpPeersV2()
+	required := cloneStringSetV2(aliveAtStart)
+	if m.v2.catchUpKnownSet {
+		mergeStringSetV2(required, m.v2.catchUpKnown)
+	}
 	discover := m.v2.catchUpTimeout
 	if extra == 0 && !m.inCluster() {
 		discover = min(discover, 50*time.Millisecond)
@@ -720,6 +768,7 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 		deadline = time.Now().Add(m.v2.catchUpTimeout)
 	}
 	seen := make(map[string]struct{})
+	discovered := make(map[string]struct{})
 	peerSnap := false
 	for {
 		remaining := time.Until(deadline)
@@ -739,40 +788,41 @@ func (m *Manager) catchUpV2(ctx context.Context) error {
 		if json.Unmarshal(msg.Data, &snap) != nil {
 			continue
 		}
-		if snap.Sender == m.serverID || !catchUpSenderExpectedV2(expected, snap.Sender) {
+		if snap.Sender == m.serverID || !catchUpSenderExpectedV2(required, snap.Sender) {
 			continue
 		}
 		m.applySnapshotReplyV2(snap)
 		seen[snap.Sender] = struct{}{}
+		discoverSnapshotMembersV2(discovered, m.serverID, snap)
+		if hook := v2TestCatchUpSawSender; hook != nil {
+			hook(snap.Sender)
+		}
 		peerSnap = true
-		need := len(expected)
-		if need < 1 {
-			need = 1
-		}
-		need += extra
-		if extra == 0 && len(seen) >= need {
-			return nil
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	others := len(expected)
-	if extra == 0 && others == 0 && !peerSnap {
+	aliveAtEnd := m.catchUpPeersV2()
+	candidate := cloneStringSetV2(aliveAtEnd)
+	mergeStringSetV2(candidate, discovered)
+	if !m.inCluster() && len(required) == 0 && len(candidate) == 0 && !peerSnap {
 		return nil
 	}
-	need := others
-	if need < 1 {
-		need = 1
+	complete := catchUpRoundCompleteV2(m.v2.catchUpKnownSet, required, candidate, seen, extra)
+	missing := !containsStringSetV2(seen, required)
+	m.v2.catchUpKnown = candidate
+	m.v2.catchUpKnownSet = true
+	if complete {
+		return nil
 	}
-	need += extra
-	if len(seen) < need {
+	if extra > 0 || missing {
 		return errV2CatchUpIncomplete
 	}
-	return nil
+	return errV2CatchUpUnstable
 }
 
 var errV2CatchUpIncomplete = errors.New("v2 catch-up incomplete")
+var errV2CatchUpUnstable = errors.New("v2 catch-up membership unstable")
 
 func (m *Manager) joinExternalQueueV2(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -918,6 +968,13 @@ func (m *Manager) syncMutationV2(mut v2MgrMutation) error {
 var errV2SyncTimeout = errors.New("v2 sync timeout")
 
 func (m *Manager) handleV2MgrSync(msg *nats.Msg) {
+	if !m.beginV2Ingress() {
+		if msg.Reply != "" {
+			_ = msg.Respond(m.encodeV2MgrAck(false, ""))
+		}
+		return
+	}
+	defer m.endV2Ingress()
 	var mut v2MgrMutation
 	if json.Unmarshal(msg.Data, &mut) != nil {
 		if msg.Reply != "" {
@@ -986,16 +1043,27 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 	if m.v2 == nil {
 		return
 	}
+	if !m.beginV2Ingress() {
+		return
+	}
+	defer m.endV2Ingress()
 	if string(msg.Data) == m.serverID {
 		return
+	}
+	if gate := v2TestSnapshotGate; gate != nil {
+		if hold := gate(m.serverID); hold != nil {
+			select {
+			case <-hold:
+			case <-m.v2.stop:
+				return
+			}
+		}
 	}
 	var nodes []v2MgrMutation
 	var sessions []v2MgrMutation
 	m.v2.mu.Lock()
 	for key, b := range m.v2.nodes {
 		nodes = append(nodes, v2MgrMutation{
-			MutationID:        "snap-node-" + key + "-" + b.registrationID,
-			MessageID:         "snap-node-" + key,
 			Kind:              v2MutationRegister,
 			Owner:             m.serverID,
 			Sender:            m.serverID,
@@ -1029,6 +1097,11 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 		})
 	}
 	m.v2.mu.Unlock()
+	for i := range nodes {
+		id := snapshotNodeMutationIDV2(nodes[i])
+		nodes[i].MutationID = id
+		nodes[i].MessageID = id
+	}
 	for i := range sessions {
 		storeSnapshot, ok := m.v2.store.SyncSnapshotV2(sessions[i].SessionID)
 		if ok {
@@ -1046,11 +1119,21 @@ func (m *Manager) handleV2MgrSnapshot(msg *nats.Msg) {
 		sessions[i].MutationID = id
 		sessions[i].MessageID = id
 	}
-	body, err := json.Marshal(v2SnapshotReply{Sender: m.serverID, Nodes: nodes, Sessions: sessions})
+	members := m.catchUpPeersV2()
+	members[m.serverID] = struct{}{}
+	memberIDs := make([]string, 0, len(members))
+	for id := range members {
+		memberIDs = append(memberIDs, id)
+	}
+	sort.Strings(memberIDs)
+	body, err := json.Marshal(v2SnapshotReply{Sender: m.serverID, Members: memberIDs, Nodes: nodes, Sessions: sessions})
 	if err != nil || msg.Reply == "" {
 		return
 	}
 	_ = msg.Respond(body)
+	if hook := v2TestSnapshotReplied; hook != nil {
+		hook(m.serverID)
+	}
 }
 
 func snapshotSessionMutationIDV2(sender, sessionID string, revision uint64, requests []v2RequestSnapshot) string {
@@ -1059,10 +1142,39 @@ func snapshotSessionMutationIDV2(sender, sessionID string, revision uint64, requ
 	return fmt.Sprintf("snap-sess-%s-%s-%d-%x", sender, sessionID, revision, digest[:8])
 }
 
+func snapshotNodeMutationIDV2(mut v2MgrMutation) string {
+	content := struct {
+		Sender            string `json:"sender"`
+		NodeKey           string `json:"node_key"`
+		RegistrationID    string `json:"registration_id"`
+		RegistrationEpoch uint64 `json:"registration_epoch"`
+		CID               uint64 `json:"cid"`
+		NatsServerID      string `json:"nats_server_id"`
+		RequestID         string `json:"request_id"`
+		Pending           bool   `json:"pending"`
+	}{
+		Sender:            mut.Sender,
+		NodeKey:           mut.NodeKey,
+		RegistrationID:    mut.RegistrationID,
+		RegistrationEpoch: mut.RegistrationEpoch,
+		CID:               mut.CID,
+		NatsServerID:      mut.NatsServerID,
+		RequestID:         mut.RequestID,
+		Pending:           mut.Pending,
+	}
+	raw, _ := json.Marshal(content)
+	digest := sha256.Sum256(raw)
+	return fmt.Sprintf("snap-node-%s-%s-%x", mut.Sender, mut.NodeKey, digest[:8])
+}
+
 func (m *Manager) handleV2MgrCommand(msg *nats.Msg) {
 	if m.v2 == nil {
 		return
 	}
+	if !m.beginV2Ingress() {
+		return
+	}
+	defer m.endV2Ingress()
 	m.v2.mu.Lock()
 	blocked := m.v2.unreachable
 	m.v2.mu.Unlock()
@@ -1084,6 +1196,10 @@ func (m *Manager) handleV2MgrCommand(msg *nats.Msg) {
 }
 
 func (m *Manager) handleV2OwnerLost(msg *nats.Msg) {
+	if !m.beginV2Ingress() {
+		return
+	}
+	defer m.endV2Ingress()
 	var mut v2MgrMutation
 	if json.Unmarshal(msg.Data, &mut) != nil {
 		return
@@ -1276,6 +1392,10 @@ func (m *Manager) publishOwnerExitV2() {
 }
 
 func (m *Manager) handleDisconnectV2(msg *nats.Msg) {
+	if !m.beginV2Ingress() {
+		return
+	}
+	defer m.endV2Ingress()
 	var ev struct {
 		Server struct {
 			ID string `json:"id"`

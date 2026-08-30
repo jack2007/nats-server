@@ -41,6 +41,11 @@ var (
 	v2TestCatchUpExtraNeed    int
 	v2TestCatchUpTimeout      time.Duration
 	v2TestCatchUpRetryDelay   time.Duration
+	v2TestSnapshotGate        func(string) <-chan struct{}
+	v2TestSnapshotReplied     func(string)
+	v2TestCatchUpSawSender    func(string)
+	v2TestStopExitEntered     chan<- struct{}
+	v2TestStopExitHold        <-chan struct{}
 	v2TestDropSessionSync     bool
 	v2TestDropSessionSyncNode string
 	v2TestFailSessionSync     atomic.Bool
@@ -87,6 +92,10 @@ type managerV2 struct {
 	registerSyncing int
 	joinedQueue     bool
 	externalReady   atomic.Bool
+	ingressMu       sync.Mutex
+	ingressCond     *sync.Cond
+	ingressOpen     bool
+	ingressActive   int
 	unreachable     bool
 	sessionMu       sync.Map
 	deliveryLocks   [v2DeliveryLockShards]sync.Mutex
@@ -100,6 +109,8 @@ type managerV2 struct {
 	catchUpDone     chan struct{}
 	catchUpTimeout  time.Duration
 	catchUpBackoff  func(int) time.Duration
+	catchUpKnown    map[string]struct{}
+	catchUpKnownSet bool
 	stats           v2Stats
 }
 
@@ -180,7 +191,10 @@ func (m *Manager) startV2() error {
 		catchUpDone:    make(chan struct{}),
 		catchUpTimeout: catchUpTimeout,
 		catchUpBackoff: catchUpBackoff,
+		catchUpKnown:   make(map[string]struct{}),
 	}
+	m.v2.ingressCond = sync.NewCond(&m.v2.ingressMu)
+	m.v2.ingressOpen = true
 	regSubj := "$P2P.V2.CMD.*.REGISTER." + m.serverID
 	sub, err := m.nc.Subscribe(regSubj, m.handleV2Command)
 	if err != nil {
@@ -216,22 +230,58 @@ func (m *Manager) stopV2() {
 		return
 	}
 	m.v2.catchUpCancel()
+	m.v2.ingressMu.Lock()
+	m.v2.ingressOpen = false
+	m.v2.ingressMu.Unlock()
 	m.v2.mu.Lock()
 	m.v2.externalReady.Store(false)
 	m.v2.mu.Unlock()
-	m.publishOwnerExitV2()
 	select {
 	case <-m.v2.stop:
 	default:
 		close(m.v2.stop)
 	}
+	m.v2.ingressMu.Lock()
+	for m.v2.ingressActive != 0 {
+		m.v2.ingressCond.Wait()
+	}
+	m.v2.ingressMu.Unlock()
 	m.v2.wg.Wait()
+	if entered := v2TestStopExitEntered; entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if hold := v2TestStopExitHold; hold != nil {
+		<-hold
+	}
+	m.publishOwnerExitV2()
 	for _, sub := range m.v2.mgrSubs {
 		_ = sub.Unsubscribe()
 	}
 	for _, sub := range m.v2.subs {
 		_ = sub.Unsubscribe()
 	}
+}
+
+func (m *Manager) beginV2Ingress() bool {
+	m.v2.ingressMu.Lock()
+	defer m.v2.ingressMu.Unlock()
+	if !m.v2.ingressOpen {
+		return false
+	}
+	m.v2.ingressActive++
+	return true
+}
+
+func (m *Manager) endV2Ingress() {
+	m.v2.ingressMu.Lock()
+	m.v2.ingressActive--
+	if m.v2.ingressActive == 0 {
+		m.v2.ingressCond.Broadcast()
+	}
+	m.v2.ingressMu.Unlock()
 }
 
 func (m *Manager) catchUpLoopV2() {
@@ -245,7 +295,7 @@ func (m *Manager) catchUpLoopV2() {
 			err = m.catchUpV2(m.v2.catchUpCtx)
 			caughtUp = err == nil
 		}
-		if initial && !caughtUp {
+		if initial && !caughtUp && !errors.Is(err, errV2CatchUpUnstable) {
 			close(m.v2.catchUpInitial)
 			initial = false
 		}
@@ -298,6 +348,12 @@ func (m *Manager) handleV2Command(msg *nats.Msg) {
 	if m.v2 == nil || msg == nil {
 		return
 	}
+	if !m.beginV2Ingress() {
+		ms := RetryAfterMsV2(0)
+		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrBusyV2, &ms)
+		return
+	}
+	defer m.endV2Ingress()
 	sender, suffix, err := ParseCommandSubjectV2(msg.Subject)
 	if v2TestOnCommand != nil {
 		v2TestOnCommand(suffix)
