@@ -900,15 +900,7 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 		}
 		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
 	case FrameKindCloseV2:
-		payload := map[string]any{
-			"session_id":      event.Identity.SessionID,
-			"connection_id":   event.Identity.ConnectionID,
-			"epoch":           event.Identity.Epoch,
-			"revision":        event.Revision,
-			"state":           string(SessionStateClosedV2),
-			"sender_node_key": v2CoordinatorSender,
-		}
-		body, err = encodeEnvelopeV2("", event.MessageID, reg, payload)
+		body, err = encodeEnvelopeV2("", event.MessageID, reg, closeEventPayloadV2(event))
 	case FrameKindErrorV2:
 		code := ErrSetupTimeoutV2
 		if event.Error != nil && event.Error.Code != "" {

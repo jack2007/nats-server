@@ -220,6 +220,15 @@ type StartEventV2 struct {
 	SenderNodeKey string
 }
 
+type CloseEventV2 struct {
+	MessageID      string
+	RegistrationID string
+	IdentityV2
+	Revision      uint64
+	State         SessionStateV2
+	SenderNodeKey string
+}
+
 type ErrorPayloadV2 struct {
 	Code         ErrorCodeV2 `json:"error"`
 	RetryAfterMs *int64      `json:"retry_after_ms,omitempty"`
@@ -242,6 +251,7 @@ type DecodedV2 struct {
 	Allocated     *AllocatedReplyV2
 	Prepare       *PrepareEventV2
 	Start         *StartEventV2
+	Close         *CloseEventV2
 	Error         *ErrorPayloadV2
 }
 
@@ -462,6 +472,12 @@ func DecodeFrameV2(kind FrameKindV2, data []byte) (*DecodedV2, error) {
 			return nil, err
 		}
 		out.Start = cmd
+	case FrameKindCloseV2:
+		cmd, err := decodeCloseV2(env)
+		if err != nil {
+			return nil, err
+		}
+		out.Close = cmd
 	case FrameKindErrorV2:
 		cmd, err := decodeErrorV2(env)
 		if err != nil {
@@ -781,6 +797,36 @@ func decodeStartV2(env EnvelopeV2) (*StartEventV2, error) {
 		RegistrationID: env.RegistrationID,
 		IdentityV2:     payload.IdentityV2,
 		Revision:       payload.Revision,
+		SenderNodeKey:  payload.SenderNodeKey,
+	}, nil
+}
+
+func decodeCloseV2(env EnvelopeV2) (*CloseEventV2, error) {
+	if err := requireEventIDsV2(env); err != nil {
+		return nil, err
+	}
+	var payload struct {
+		IdentityV2
+		Revision      uint64         `json:"revision"`
+		State         SessionStateV2 `json:"state"`
+		SenderNodeKey string         `json:"sender_node_key"`
+	}
+	if err := decodeStrictV2(env.Payload, &payload); err != nil {
+		return nil, err
+	}
+	if err := validateIdentityV2(payload.IdentityV2); err != nil {
+		return nil, err
+	}
+	if payload.Revision == 0 || payload.State != SessionStateClosedV2 ||
+		payload.SenderNodeKey != v2CoordinatorSender {
+		return nil, invalidRequestV2()
+	}
+	return &CloseEventV2{
+		MessageID:      env.MessageID,
+		RegistrationID: env.RegistrationID,
+		IdentityV2:     payload.IdentityV2,
+		Revision:       payload.Revision,
+		State:          payload.State,
 		SenderNodeKey:  payload.SenderNodeKey,
 	}, nil
 }

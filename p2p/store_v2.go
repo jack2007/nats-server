@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -699,8 +700,15 @@ func (s *StoreV2) closeSessionLocked(sess *sessionRecordV2) []EventV2 {
 		conn.state = ConnectionStateClosedV2
 	}
 	s.dropSessionDirectionsLocked(sess.id)
-	conn := sess.connections["conn-0"]
-	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
+	connectionIDs := make([]string, 0, len(sess.connections))
+	for connectionID := range sess.connections {
+		connectionIDs = append(connectionIDs, connectionID)
+	}
+	sort.Strings(connectionIDs)
+	events := make([]EventV2, 0, len(connectionIDs)*2)
+	for _, connectionID := range connectionIDs {
+		events = append(events, s.notifyBoth(sess, sess.connections[connectionID], FrameKindCloseV2)...)
+	}
 	sess.closeEvents = events
 	s.buryLocked(sess)
 	return events
@@ -931,6 +939,17 @@ func (s *StoreV2) notifyEvent(sess *sessionRecordV2, target string, ident Identi
 		MessageID:      msg,
 		Identity:       ident,
 		Revision:       sess.revision,
+	}
+}
+
+func closeEventPayloadV2(event EventV2) map[string]any {
+	return map[string]any{
+		"session_id":      event.Identity.SessionID,
+		"connection_id":   event.Identity.ConnectionID,
+		"epoch":           event.Identity.Epoch,
+		"revision":        event.Revision,
+		"state":           string(SessionStateClosedV2),
+		"sender_node_key": v2CoordinatorSender,
 	}
 }
 

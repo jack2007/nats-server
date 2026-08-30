@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -419,6 +420,113 @@ func TestV2Protocol_GoldenVectors(t *testing.T) {
 				t.Fatalf("vector error %q", c.Error)
 			}
 		})
+	}
+}
+
+func TestV2Protocol_CloseProducerMatchesGoldenVectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("p2p", testWireVectorsV2))
+	if err != nil {
+		raw, err = os.ReadFile(testWireVectorsV2)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Cases []struct {
+			Name string          `json:"name"`
+			Body json.RawMessage `json:"body"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	vectors := make(map[string]json.RawMessage)
+	for _, c := range file.Cases {
+		if c.Name == "connection_close_event_ok" || c.Name == "session_close_event_ok" {
+			vectors[c.Name] = c.Body
+		}
+	}
+	if len(vectors) != 2 {
+		t.Fatalf("close vectors=%d", len(vectors))
+	}
+
+	s := NewStoreV2(nil, 1)
+	s.nodes[testNodeKeyV2] = &nodeRecordV2{key: testNodeKeyV2, registrationID: testRegIDV2}
+	s.nodes[testServerNodeV2] = &nodeRecordV2{key: testServerNodeV2, registrationID: testRegIDV2}
+	sess := &sessionRecordV2{
+		id:       testSessionIDV2,
+		revision: 7,
+		client:   testNodeKeyV2,
+		server:   testServerNodeV2,
+	}
+	conn := &connectionRecordV2{id: testConnectionV2, epoch: 2}
+	events := s.notifyBoth(sess, conn, FrameKindCloseV2)
+	if len(events) != 2 {
+		t.Fatalf("close events=%d", len(events))
+	}
+	for _, name := range []string{"connection_close_event_ok", "session_close_event_ok"} {
+		var want EnvelopeV2
+		if err := json.Unmarshal(vectors[name], &want); err != nil {
+			t.Fatal(err)
+		}
+		event := events[0]
+		event.MessageID = want.MessageID
+		gotRaw, err := encodeEnvelopeV2("", event.MessageID, event.RegistrationID, closeEventPayloadV2(event))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got, expected map[string]any
+		if err := json.Unmarshal(gotRaw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(vectors[name], &expected); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("%s: got=%s want=%s", name, gotRaw, vectors[name])
+		}
+		dec, err := DecodeFrameV2(FrameKindCloseV2, gotRaw)
+		if err != nil || dec.Close == nil || dec.Close.IdentityV2 != event.Identity ||
+			dec.Close.Revision != event.Revision || dec.Close.State != SessionStateClosedV2 ||
+			dec.Close.SenderNodeKey != v2CoordinatorSender {
+			t.Fatalf("%s: decoded=%+v err=%v", name, dec, err)
+		}
+	}
+}
+
+func TestV2Protocol_SessionCloseProducesEveryConnectionGeneration(t *testing.T) {
+	s := NewStoreV2(nil, 2)
+	s.nodes[testNodeKeyV2] = &nodeRecordV2{key: testNodeKeyV2, registrationID: testRegIDV2}
+	s.nodes[testServerNodeV2] = &nodeRecordV2{key: testServerNodeV2, registrationID: testRegIDV2}
+	sess := &sessionRecordV2{
+		id:       testSessionIDV2,
+		revision: 7,
+		client:   testNodeKeyV2,
+		server:   testServerNodeV2,
+		connections: map[string]*connectionRecordV2{
+			"conn-0": {id: "conn-0", epoch: 2},
+			"conn-1": {id: "conn-1", epoch: 3},
+		},
+	}
+	s.sessions[sess.id] = sess
+	events := s.closeSessionLocked(sess)
+	if len(events) != 4 {
+		t.Fatalf("close events=%d, want 4", len(events))
+	}
+	seen := make(map[GenerationKeyV2]int)
+	for _, event := range events {
+		if event.Kind != FrameKindCloseV2 {
+			t.Fatalf("kind=%q", event.Kind)
+		}
+		seen[GenerationKeyV2{SessionID: event.Identity.SessionID, ConnectionID: event.Identity.ConnectionID, Epoch: event.Identity.Epoch}]++
+	}
+	for _, key := range []GenerationKeyV2{
+		{SessionID: testSessionIDV2, ConnectionID: "conn-0", Epoch: 2},
+		{SessionID: testSessionIDV2, ConnectionID: "conn-1", Epoch: 3},
+	} {
+		if seen[key] != 2 {
+			t.Fatalf("generation %+v events=%d, want 2", key, seen[key])
+		}
 	}
 }
 
