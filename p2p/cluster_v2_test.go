@@ -958,9 +958,118 @@ func TestClusterV2_IncompleteCatchUpDoesNotJoinQueue(t *testing.T) {
 	reg := newRegistrationIDV2(t)
 	nc := agentConnApp(t, sC, "catchup-self")
 	t.Cleanup(nc.Close)
-	mustRegisterV2(t, nc, sC.ID(), "catchup-self", reg)
+	subj, err := RegisterSubjectV2("catchup-self", sC.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := requestV2Wait(t, nc, subj, registerFrameV2(t, mustUUIDV2(t), reg), time.Second)
+	if perr := mustErrorV2(t, reply.Data); perr.Code != ErrBusyV2 || perr.RetryAfterMs == nil {
+		t.Fatalf("REGISTER during incomplete catch-up = %+v body=%s", perr, reply.Data)
+	}
+	if _, ok := mHold.v2.store.LookupNode("catchup-self"); ok {
+		t.Fatal("incomplete catch-up REGISTER committed registration")
+	}
 	if mHold.joinedQueueGroupV2() {
 		t.Fatal("REGISTER-to-self must not join external queue after incomplete catch-up")
+	}
+}
+
+func TestClusterV2_RegisterWaitsForExternalQueueJoin(t *testing.T) {
+	s, peerServer := startClusterPair(t)
+	holdJoin := make(chan struct{})
+	var attempts atomic.Int64
+	v2TestCatchUpTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { v2TestCatchUpTimeout = 0 })
+	peer, err := StartManager(peerServer, clusterConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(peer.Stop)
+	select {
+	case <-peer.v2.catchUpDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer manager did not become ready")
+	}
+
+	v2TestCatchUpExtraNeed = 8
+	v2TestCatchUpRetryDelay = time.Hour
+	v2TestHoldJoinQueue = holdJoin
+	v2TestBeforeCatchUp = func(*Manager) {
+		if attempts.Add(1) > 1 {
+			v2TestCatchUpExtraNeed = 0
+		}
+	}
+	t.Cleanup(func() {
+		select {
+		case <-holdJoin:
+		default:
+			close(holdJoin)
+		}
+		v2TestCatchUpExtraNeed = 0
+		v2TestCatchUpRetryDelay = 0
+		v2TestHoldJoinQueue = nil
+		v2TestBeforeCatchUp = nil
+	})
+	m, err := StartManager(s, clusterConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	if m.joinedQueueGroupV2() || m.v2.externalReady.Load() {
+		t.Fatal("manager joined before catch-up recovery")
+	}
+
+	nodeKey := "catchup-register"
+	requestID := mustUUIDV2(t)
+	registrationID := newRegistrationIDV2(t)
+	nc := agentConnApp(t, s, nodeKey)
+	t.Cleanup(nc.Close)
+	subj, err := RegisterSubjectV2(nodeKey, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := registerFrameV2(t, requestID, registrationID)
+	busy := requestV2Wait(t, nc, subj, body, time.Second)
+	perr := mustErrorV2(t, busy.Data)
+	if perr.Code != ErrBusyV2 || perr.RetryAfterMs == nil {
+		t.Fatalf("REGISTER before queue join = %+v body=%s", perr, busy.Data)
+	}
+	deadline := time.Now().Add(time.Second)
+	for attempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("REGISTER did not wake catch-up retry: attempts=%d", attempts.Load())
+	}
+	if _, ok := m.v2.store.LookupNode(nodeKey); ok {
+		t.Fatal("Busy REGISTER committed store registration before queue join")
+	}
+	m.v2.mu.Lock()
+	_, bound := m.v2.nodes[nodeKey]
+	m.v2.mu.Unlock()
+	if bound {
+		t.Fatal("Busy REGISTER committed manager binding before queue join")
+	}
+
+	close(holdJoin)
+	select {
+	case <-m.v2.catchUpDone:
+	case <-time.After(time.Second):
+		t.Fatal("manager did not join after catch-up release")
+	}
+	if !m.joinedQueueGroupV2() || !m.v2.externalReady.Load() {
+		t.Fatal("REGISTER recovery started before external queue admission")
+	}
+	retry := requestV2Wait(t, nc, subj, body, time.Second)
+	dec, err := DecodeFrameV2(FrameKindRegisterReplyV2, retry.Data)
+	if err != nil {
+		t.Fatalf("REGISTER retry after join: %v body=%s", err, retry.Data)
+	}
+	if dec.RegisterReply.RegistrationID != registrationID {
+		t.Fatalf("REGISTER retry id=%s want=%s", dec.RegisterReply.RegistrationID, registrationID)
+	}
+	if snap, ok := m.v2.store.LookupNode(nodeKey); !ok || snap.RegistrationID != registrationID {
+		t.Fatalf("registration after queue join = %+v ok=%v", snap, ok)
 	}
 }
 
@@ -2017,7 +2126,7 @@ func TestClusterV2_CreateRetryUnsyncedMemberNoSecondOwner(t *testing.T) {
 	}
 
 	client := registerOnServerV2(t, sA, mgrClientNodeV2, newRegistrationIDV2(t))
-	_ = registerOnServerV2(t, sB, mgrServerNodeV2, newRegistrationIDV2(t))
+	_ = registerOnServerV2(t, sA, mgrServerNodeV2, newRegistrationIDV2(t))
 
 	createSubj, err := CommandSubjectV2(mgrClientNodeV2, "SESSION.CREATE")
 	if err != nil {

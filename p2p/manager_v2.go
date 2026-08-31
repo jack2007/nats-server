@@ -379,6 +379,12 @@ func (m *Manager) handleV2Command(msg *nats.Msg) {
 		return
 	}
 	if strings.HasPrefix(suffix, "REGISTER.") {
+		m.wakeCatchUpV2()
+		if !m.v2.externalReady.Load() {
+			ms := RetryAfterMsV2(0)
+			m.replyV2Error(msg, requestIDFromData(msg.Data), ErrBusyV2, &ms)
+			return
+		}
 		m.handleRegisterV2(msg, sender, suffix)
 		return
 	}
@@ -452,7 +458,6 @@ func (m *Manager) handleRegisterV2(msg *nats.Msg, sender, suffix string) {
 		m.replyV2Error(msg, requestIDFromData(msg.Data), ErrInvalidRequestV2, nil)
 		return
 	}
-	m.wakeCatchUpV2()
 	dec, err := DecodeFrameV2(FrameKindRegisterV2, msg.Data)
 	if err != nil {
 		m.replyV2Error(msg, requestIDFromData(msg.Data), protocolCodeV2(err), nil)
