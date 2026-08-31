@@ -433,7 +433,7 @@ func TestManagerV2_SignalRetryUsesCurrentRegistration(t *testing.T) {
 	failOnce.Store(true)
 	var publishes []string
 	var pubMu sync.Mutex
-	v2TestPublishHook = func(subj string, _ []byte) error {
+	setV2TestPublishHook(func(subj string, _ []byte) error {
 		pubMu.Lock()
 		publishes = append(publishes, subj)
 		pubMu.Unlock()
@@ -441,8 +441,8 @@ func TestManagerV2_SignalRetryUsesCurrentRegistration(t *testing.T) {
 			return nats.ErrInvalidConnection
 		}
 		return nil
-	}
-	t.Cleanup(func() { v2TestPublishHook = nil })
+	})
+	t.Cleanup(func() { setV2TestPublishHook(nil) })
 
 	newReg := "dddddddddddddddddddddddddddddddd"
 	newEv := subscribeEventsV2(t, srv, mgrServerNodeV2, newReg)
@@ -513,16 +513,16 @@ func TestManagerV2_SignalRetryDoesNotBlockStoreOrCallback(t *testing.T) {
 
 	block := make(chan struct{})
 	var inPublish atomic.Bool
-	v2TestPublishHook = func(subj string, _ []byte) error {
+	setV2TestPublishHook(func(subj string, _ []byte) error {
 		if !isSignalEventSubject(subj) {
 			return nil
 		}
 		inPublish.Store(true)
 		<-block
 		return nil
-	}
+	})
 	t.Cleanup(func() {
-		v2TestPublishHook = nil
+		setV2TestPublishHook(nil)
 		select {
 		case <-block:
 		default:
@@ -693,13 +693,13 @@ func TestManagerV2_SignalRetryStopsAfterSetupDeadline(t *testing.T) {
 	ident, _ := mustCreateBindReadySessionTimeoutV2(t, client, srv, clientEv, serverEv, shortMs)
 
 	var pubs atomic.Int64
-	v2TestPublishHook = func(subj string, data []byte) error {
+	setV2TestPublishHook(func(subj string, data []byte) error {
 		if signalSendPayloadV2(data) {
 			pubs.Add(1)
 		}
 		return nil
-	}
-	t.Cleanup(func() { v2TestPublishHook = nil })
+	})
+	t.Cleanup(func() { setV2TestPublishHook(nil) })
 
 	sendSubj, err := CommandSubjectV2(mgrClientNodeV2, "SIGNAL.SEND")
 	if err != nil {
@@ -755,7 +755,7 @@ func TestManagerV2_SignalRetryStopsAfterRestartAndSessionClose(t *testing.T) {
 
 	var mu sync.Mutex
 	var pubs []signalRetryPubV2
-	v2TestPublishHook = func(subj string, data []byte) error {
+	setV2TestPublishHook(func(subj string, data []byte) error {
 		if !signalSendPayloadV2(data) {
 			return nil
 		}
@@ -764,8 +764,8 @@ func TestManagerV2_SignalRetryStopsAfterRestartAndSessionClose(t *testing.T) {
 		pubs = append(pubs, signalRetryPubV2{at: time.Now(), epoch: uint64(limitVal(p["epoch"]))})
 		mu.Unlock()
 		return nil
-	}
-	t.Cleanup(func() { v2TestPublishHook = nil })
+	})
+	t.Cleanup(func() { setV2TestPublishHook(nil) })
 
 	sendSubj, err := CommandSubjectV2(mgrClientNodeV2, "SIGNAL.SEND")
 	if err != nil {

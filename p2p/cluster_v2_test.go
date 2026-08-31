@@ -1921,7 +1921,7 @@ func TestClusterV2_DeliveryConfirmedBeforeNextPublish(t *testing.T) {
 	releaseSecond := make(chan struct{})
 	var attemptsMu sync.Mutex
 	var attempts []string
-	v2TestPublishHook = func(_ string, data []byte) error {
+	setV2TestPublishHook(func(_ string, data []byte) error {
 		var env EnvelopeV2
 		if err := json.Unmarshal(data, &env); err != nil {
 			return err
@@ -1936,8 +1936,8 @@ func TestClusterV2_DeliveryConfirmedBeforeNextPublish(t *testing.T) {
 			return errors.New("injected second publish failure")
 		}
 		return nil
-	}
-	t.Cleanup(func() { v2TestPublishHook = nil })
+	})
+	t.Cleanup(func() { setV2TestPublishHook(nil) })
 	replyCh := make(chan *nats.Msg, 1)
 	errCh := make(chan error, 1)
 	go func() {

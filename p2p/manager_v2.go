@@ -32,7 +32,7 @@ var (
 	v2TestQueueSize           int
 	v2TestWorkers             int
 	v2TestBlock               func()
-	v2TestPublishHook         func(subj string, data []byte) error
+	v2TestPublishHook         atomic.Pointer[v2PublishHook]
 	v2TestHoldJoinQueue       <-chan struct{}
 	v2TestHoldRegisterSync    <-chan struct{}
 	v2TestHoldRegisterApply   <-chan struct{}
@@ -58,6 +58,18 @@ var (
 type v2SessionSyncGate struct {
 	entered chan struct{}
 	release chan struct{}
+}
+
+type v2PublishHook struct {
+	fn func(subj string, data []byte) error
+}
+
+func setV2TestPublishHook(fn func(subj string, data []byte) error) {
+	if fn == nil {
+		v2TestPublishHook.Store(nil)
+		return
+	}
+	v2TestPublishHook.Store(&v2PublishHook{fn: fn})
 }
 
 type v2NodeBinding struct {
@@ -1201,8 +1213,8 @@ func (m *Manager) publishV2Event(nodeKey string, event EventV2) error {
 	if err != nil {
 		return err
 	}
-	if v2TestPublishHook != nil {
-		if err := v2TestPublishHook(subj, body); err != nil {
+	if hook := v2TestPublishHook.Load(); hook != nil {
+		if err := hook.fn(subj, body); err != nil {
 			return err
 		}
 	}

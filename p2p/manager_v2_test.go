@@ -1034,7 +1034,7 @@ func TestManagerV2_StatePublishRetry(t *testing.T) {
 
 			var hookMu sync.Mutex
 			var attempts []string
-			v2TestPublishHook = func(_ string, data []byte) error {
+			setV2TestPublishHook(func(_ string, data []byte) error {
 				var env EnvelopeV2
 				if err := json.Unmarshal(data, &env); err != nil {
 					return err
@@ -1046,8 +1046,8 @@ func TestManagerV2_StatePublishRetry(t *testing.T) {
 					return errors.New("injected second publish failure")
 				}
 				return nil
-			}
-			t.Cleanup(func() { v2TestPublishHook = nil })
+			})
+			t.Cleanup(func() { setV2TestPublishHook(nil) })
 
 			first := requestV2(t, sender, subject, frame)
 			if perr := mustErrorV2(t, first.Data); perr.Code != ErrBusyV2 || perr.RetryAfterMs == nil {
@@ -1146,13 +1146,13 @@ func TestManagerV2_ConcurrentPublishRetrySerializesDelivery(t *testing.T) {
 	entered := make(chan struct{}, 4)
 	release := make(chan struct{})
 	var attempts atomic.Int32
-	v2TestPublishHook = func(_ string, _ []byte) error {
+	setV2TestPublishHook(func(_ string, _ []byte) error {
 		attempts.Add(1)
 		entered <- struct{}{}
 		<-release
 		return nil
-	}
-	t.Cleanup(func() { v2TestPublishHook = nil })
+	})
+	t.Cleanup(func() { setV2TestPublishHook(nil) })
 
 	request := func(done chan<- *nats.Msg) {
 		got, err := client.Request(subject, frame, 2*time.Second)
@@ -1357,13 +1357,13 @@ func TestManagerV2_DeliverySyncFailureStopsPublishLoop(t *testing.T) {
 	bindSubj, _ := CommandSubjectV2(mgrClientNodeV2, "SESSION.COMMAND")
 	frame := sessionCmdFrameV2(t, reqID, SessionCommandBindV2, ident, alloc.Allocated.Revision)
 	var attempts atomic.Int32
-	v2TestPublishHook = func(_ string, _ []byte) error {
+	setV2TestPublishHook(func(_ string, _ []byte) error {
 		attempts.Add(1)
 		return nil
-	}
+	})
 	v2TestFailDeliverySync.Store(true)
 	t.Cleanup(func() {
-		v2TestPublishHook = nil
+		setV2TestPublishHook(nil)
 		v2TestFailDeliverySync.Store(false)
 	})
 
