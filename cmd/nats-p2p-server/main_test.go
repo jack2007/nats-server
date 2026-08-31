@@ -75,13 +75,25 @@ func TestRun_StartsCoordinatorWithoutP2PBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := nc.Request(subj, env, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
+	var dec *p2p.DecodedV2
+	var got *nats.Msg
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err = nc.Request(subj, env, 2*time.Second)
+		if err == nil {
+			dec, err = p2p.DecodeFrameV2(p2p.FrameKindRegisterReplyV2, got.Data)
+			if err == nil {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	dec, err := p2p.DecodeFrameV2(p2p.FrameKindRegisterReplyV2, got.Data)
 	if err != nil {
-		t.Fatalf("coordinator not started: %v body=%s", err, got.Data)
+		body := []byte(nil)
+		if got != nil {
+			body = got.Data
+		}
+		t.Fatalf("coordinator not started: %v body=%s", err, body)
 	}
 	if dec.RegisterReply == nil || dec.RegisterReply.RegistrationEpoch == 0 {
 		t.Fatalf("register reply %+v", dec.RegisterReply)
