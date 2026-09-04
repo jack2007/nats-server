@@ -2075,7 +2075,19 @@ func TestClusterV2_LateJoinSnapshotsPeerBeforeQueueJoin(t *testing.T) {
 	if err := mC.dropQueueGroupV2(); err != nil {
 		t.Fatal(err)
 	}
-	retry := requestV2Wait(t, client, createSubj, createFrameV2(t, reqID, mgrServerNodeV2), 5*time.Second)
+	retryFrame := createFrameV2(t, reqID, mgrServerNodeV2)
+	retryDeadline := time.Now().Add(5 * time.Second)
+	var retry *nats.Msg
+	for retry == nil {
+		got, requestErr := client.Request(createSubj, retryFrame, 250*time.Millisecond)
+		if requestErr == nil {
+			retry = got
+			break
+		}
+		if !errors.Is(requestErr, nats.ErrTimeout) || time.Now().After(retryDeadline) {
+			t.Fatalf("retry CREATE after queue handoff: %v", requestErr)
+		}
+	}
 	again, err := DecodeFrameV2(FrameKindAllocatedV2, retry.Data)
 	if err != nil {
 		t.Fatalf("retry CREATE after late join: %v body=%s", err, retry.Data)
