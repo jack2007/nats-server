@@ -224,7 +224,9 @@ func TestAuthCalloutRejectsWrongPassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(svc.Stop)
-	_, err = nats.Connect("", nats.InProcessServer(s), nats.UserInfo(AgentUser, "wrong"), nats.Name("client-a"))
+	_, err = connectTCPWithDynamicCredentials(s, "client-a", func(user, _ string) (string, string) {
+		return user, "wrong"
+	})
 	if err == nil {
 		t.Fatal("expected authorization failure")
 	}
@@ -247,7 +249,9 @@ func TestAuthCalloutAcceptsAgentAndBlocksMgr(t *testing.T) {
 	}
 	t.Cleanup(m.Stop)
 
-	nc, err := nats.Connect("", nats.InProcessServer(s), nats.UserInfo(AgentUser, AgentPassword), nats.Name("client-a"))
+	nc, err := connectTCPWithDynamicCredentials(s, "client-a", func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +308,9 @@ func TestAuthCalloutRejectsInvalidConnectNameV2(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(svc.Stop)
-	_, err = nats.Connect("", nats.InProcessServer(s), nats.UserInfo(AgentUser, AgentPassword), nats.Name("bad node"))
+	_, err = connectTCPWithDynamicCredentials(s, "bad node", func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err == nil {
 		t.Fatal("invalid CONNECT name must be denied")
 	}

@@ -1,9 +1,14 @@
 package p2p
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -123,9 +128,77 @@ func connectTCP(s *server.Server, user, pass, name string) (*nats.Conn, error) {
 	return nats.Connect(s.ClientURL(), opts...)
 }
 
+type infoPrefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *infoPrefixConn) Read(p []byte) (int, error) {
+	if len(c.prefix) != 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+type sharedKeyDialer struct {
+	sharedKey *string
+}
+
+func (d *sharedKeyDialer) Dial(network, address string) (net.Conn, error) {
+	conn, err := (&net.Dialer{Timeout: 4 * time.Second}).Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	var info struct {
+		SharedKey string `json:"sharedkey"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("INFO "))), &info); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if info.SharedKey == "" {
+		conn.Close()
+		return nil, fmt.Errorf("server INFO missing sharedkey")
+	}
+	*d.sharedKey = info.SharedKey
+	return &infoPrefixConn{Conn: conn, prefix: line}, nil
+}
+
+func connectTCPWithDynamicCredentials(s *server.Server, name string, mutate func(string, string) (string, string)) (*nats.Conn, error) {
+	var sharedKey string
+	dialer := &sharedKeyDialer{sharedKey: &sharedKey}
+	opts := []nats.Option{
+		nats.Timeout(4 * time.Second),
+		nats.SetCustomDialer(dialer),
+		nats.UserInfoHandler(func() (string, string) {
+			key, err := strconv.ParseUint(sharedKey, 16, 32)
+			if err != nil || key <= 1000000 {
+				return "", ""
+			}
+			const user uint64 = 0x123456
+			userHex := fmt.Sprintf("%08x", user)
+			passHex := fmt.Sprintf("%016x", user*key)
+			return mutate(userHex, passHex)
+		}),
+	}
+	if name != "" {
+		opts = append(opts, nats.Name(name))
+	}
+	return nats.Connect(s.ClientURL(), opts...)
+}
+
 func mustConnectAgent(t *testing.T, s *server.Server, name string) *nats.Conn {
 	t.Helper()
-	nc, err := connectTCP(s, AgentUser, AgentPassword, name)
+	nc, err := connectTCPWithDynamicCredentials(s, name, func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,19 +212,27 @@ func TestTCPCalloutAcceptsAgentRejectsBadAndEmpty(t *testing.T) {
 	if _, err := connectTCP(s, "app", "app", "legacy"); err == nil {
 		t.Fatal("legacy app/app must fail")
 	}
-	if _, err := connectTCP(s, AgentUser, "wrong", "bad-pass"); err == nil {
+	if _, err := connectTCPWithDynamicCredentials(s, "bad-pass", func(user, pass string) (string, string) {
+		return user, "wrong"
+	}); err == nil {
 		t.Fatal("wrong password must fail")
 	}
-	if _, err := connectTCP(s, "", AgentPassword, "empty-user"); err == nil {
+	if _, err := connectTCPWithDynamicCredentials(s, "empty-user", func(_, _ string) (string, string) {
+		return "", ""
+	}); err == nil {
 		t.Fatal("empty user must fail")
 	}
-	if _, err := connectTCP(s, AgentUser, "", "empty-pass"); err == nil {
+	if _, err := connectTCPWithDynamicCredentials(s, "empty-pass", func(user, _ string) (string, string) {
+		return user, ""
+	}); err == nil {
 		t.Fatal("empty password must fail")
 	}
 	if _, err := nats.Connect(s.ClientURL(), nats.Token("SECRET"), nats.Timeout(4*time.Second)); err == nil {
 		t.Fatal("token-only CONNECT must fail")
 	}
-	nc, err := connectTCP(s, AgentUser, AgentPassword, "client-a")
+	nc, err := connectTCPWithDynamicCredentials(s, "client-a", func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +242,9 @@ func TestTCPCalloutAcceptsAgentRejectsBadAndEmpty(t *testing.T) {
 func TestTCPCalloutRestrictedInboxPermsTimesOut(t *testing.T) {
 	s, _, _ := startTCPCalloutFromConf(t, restrictedCalloutConf(), true, Config{})
 	start := time.Now()
-	_, err := connectTCP(s, AgentUser, AgentPassword, "client-a")
+	_, err := connectTCPWithDynamicCredentials(s, "client-a", func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err == nil {
 		t.Fatal("restricted auth-internal must drop Callout replies")
 	}
@@ -236,7 +319,9 @@ func TestTCPCalloutHardDisconnectWithoutSysKeepsOccupancy(t *testing.T) {
 	nc := mustConnectAgent(t, s, "node-z")
 	mustRegisterV2(t, nc, s.ID(), "node-z", newRegistrationIDV2(t))
 	nc.Close()
-	nc2, err := connectTCP(s, AgentUser, AgentPassword, "node-z")
+	nc2, err := connectTCPWithDynamicCredentials(s, "node-z", func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +335,9 @@ func TestTCPCalloutHardDisconnectWithoutSysKeepsOccupancy(t *testing.T) {
 func TestTCPCalloutStopsRejectingNewConnects(t *testing.T) {
 	s, auth, _ := startTCPCalloutFromConf(t, defaultCalloutConf(), true, Config{})
 	auth.Stop()
-	if _, err := connectTCP(s, AgentUser, AgentPassword, "after-stop"); err == nil {
+	if _, err := connectTCPWithDynamicCredentials(s, "after-stop", func(user, pass string) (string, string) {
+		return user, pass
+	}); err == nil {
 		t.Fatal("CONNECT after auth.Stop must fail")
 	}
 }

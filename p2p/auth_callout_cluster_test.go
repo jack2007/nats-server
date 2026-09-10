@@ -121,17 +121,23 @@ func TestCalloutClusterPeerMayAnswerButAllStoppedRejects(t *testing.T) {
 	authA.Stop()
 	time.Sleep(100 * time.Millisecond)
 	// Same issuer on every node: cluster may deliver $SYS.REQ.USER.AUTH to B.
-	nc, err := connectTCP(sB, AgentUser, AgentPassword, "on-b")
+	nc, err := connectTCPWithDynamicCredentials(sB, "on-b", func(user, pass string) (string, string) {
+		return user, pass
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	nc.Close()
 	authB.Stop()
 	time.Sleep(100 * time.Millisecond)
-	if _, err := connectTCP(sA, AgentUser, AgentPassword, "on-a"); err == nil {
+	if _, err := connectTCPWithDynamicCredentials(sA, "on-a", func(user, pass string) (string, string) {
+		return user, pass
+	}); err == nil {
 		t.Fatal("CONNECT must fail after every local auth stopped")
 	}
-	if _, err := connectTCP(sB, AgentUser, AgentPassword, "on-b-2"); err == nil {
+	if _, err := connectTCPWithDynamicCredentials(sB, "on-b-2", func(user, pass string) (string, string) {
+		return user, pass
+	}); err == nil {
 		t.Fatal("CONNECT must fail after every local auth stopped")
 	}
 }
