@@ -18,6 +18,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,9 +31,10 @@ import (
 
 // Nonce has to be a string since we used different encoding by default than json.Unmarshal.
 type nonceInfo struct {
-	Id    string `json:"server_id"`
-	CID   uint64 `json:"client_id,omitempty"`
-	Nonce string `json:"nonce,omitempty"`
+	Id        string `json:"server_id"`
+	CID       uint64 `json:"client_id,omitempty"`
+	Nonce     string `json:"nonce,omitempty"`
+	SharedKey string `json:"sharedkey,omitempty"`
 }
 
 // This is a seed for a user. We can extract public and private keys from this for testing.
@@ -74,6 +76,21 @@ func TestServerInfoNonceAlwaysEnabled(t *testing.T) {
 	}
 	if info.Nonce == "" {
 		t.Fatalf("Expected a non-empty nonce with AlwaysEnableNonce set")
+	}
+	if info.SharedKey == "" {
+		t.Fatalf("Expected a non-empty sharedkey")
+	}
+	if _, err := strconv.ParseUint(info.SharedKey, 16, 32); err != nil {
+		t.Fatalf("invalid sharedkey %q: %v", info.SharedKey, err)
+	}
+}
+
+func TestSharedKeyMappingStaysAboveMinimum(t *testing.T) {
+	for _, raw := range []uint32{0, 1_000_000, ^uint32(0)} {
+		key := mapSharedKey(raw)
+		if key <= 1_000_000 {
+			t.Fatalf("mapSharedKey(%d) = %d, want > 1000000", raw, key)
+		}
 	}
 }
 

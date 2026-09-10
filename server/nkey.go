@@ -16,7 +16,22 @@ package server
 import (
 	crand "crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 )
+
+func mapSharedKey(raw uint32) uint32 {
+	const min = uint32(1_000_001)
+	const span = uint64(^uint32(0)) - uint64(min) + 1
+	return min + uint32(uint64(raw)%span)
+}
+
+func generateSharedKey() uint32 {
+	var raw [4]byte
+	if _, err := crand.Read(raw[:]); err != nil {
+		panic(err)
+	}
+	return mapSharedKey(binary.BigEndian.Uint32(raw[:]))
+}
 
 // Raw length of the nonce challenge
 const (

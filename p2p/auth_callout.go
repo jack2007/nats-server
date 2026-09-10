@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +54,30 @@ func MatchAgentCreds(user, password string) bool {
 	u := subtle.ConstantTimeCompare([]byte(user), []byte(AgentUser))
 	p := subtle.ConstantTimeCompare([]byte(password), []byte(AgentPassword))
 	return u == 1 && p == 1
+}
+
+// MatchAgentSharedKeyCreds verifies the one-shot credentials bound to the
+// shared key advertised in this connection's INFO. Hex values may omit leading
+// zeroes, but are bounded to the uint32/uint64 widths.
+func MatchAgentSharedKeyCreds(user, password, sharedKey string) bool {
+	if len(user) == 0 || len(user) > 8 ||
+		len(password) == 0 || len(password) > 16 ||
+		len(sharedKey) == 0 || len(sharedKey) > 8 {
+		return false
+	}
+	u, err := strconv.ParseUint(user, 16, 32)
+	if err != nil {
+		return false
+	}
+	p, err := strconv.ParseUint(password, 16, 64)
+	if err != nil {
+		return false
+	}
+	k, err := strconv.ParseUint(sharedKey, 16, 32)
+	if err != nil || k <= 1_000_000 {
+		return false
+	}
+	return u > 1_000_000 && uint64(uint32(u))*uint64(uint32(k)) == p
 }
 
 func agentV2AllowSubjects(nodeKey string) (cmdAllow, eventAllow string, err error) {
@@ -172,7 +197,7 @@ func (a *AuthCalloutService) handle(msg *nats.Msg) {
 	}
 	userNkey := ac.UserNkey
 	serverID := ac.Server.ID
-	if !MatchAgentCreds(ac.ConnectOptions.Username, ac.ConnectOptions.Password) {
+	if !MatchAgentSharedKeyCreds(ac.ConnectOptions.Username, ac.ConnectOptions.Password, ac.ClientInformation.Nonce) {
 		raw, err := EncodeAuthResponse(userNkey, serverID, "", "authorization denied")
 		if err == nil {
 			_ = msg.Respond(raw)

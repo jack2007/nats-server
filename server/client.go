@@ -275,6 +275,7 @@ type client struct {
 	cid        uint64
 	start      time.Time
 	nonce      []byte
+	sharedKey  uint32
 	pubKey     string
 	nc         net.Conn
 	ncs        atomic.Value

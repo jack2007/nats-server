@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,25 @@ func TestMatchAgentCreds(t *testing.T) {
 	}
 	if MatchAgentCreds(AgentUser, "") {
 		t.Fatal("empty password")
+	}
+}
+
+func TestMatchAgentSharedKeyCreds(t *testing.T) {
+	key, user := uint32(1000003), uint32(0x123456)
+	password := uint64(user) * uint64(key)
+	if !MatchAgentSharedKeyCreds(fmt.Sprintf("%08x", user), fmt.Sprintf("%016x", password), fmt.Sprintf("%08x", key)) {
+		t.Fatal("expected matching shared-key credentials")
+	}
+	if !MatchAgentSharedKeyCreds("123456", fmt.Sprintf("%x", password), "f4243") {
+		t.Fatal("short hex values should be left-padded with zeroes")
+	}
+	for _, value := range [][3]string{{"000f4240", fmt.Sprintf("%016x", uint64(1000000)*uint64(key)), fmt.Sprintf("%08x", key)},
+		{fmt.Sprintf("%08x", user), "10000000000000000", fmt.Sprintf("%08x", key)},
+		{fmt.Sprintf("%08x", user), fmt.Sprintf("%016x", password+1), fmt.Sprintf("%08x", key)},
+		{fmt.Sprintf("%08x", user), fmt.Sprintf("%016x", password), "000f4240"}} {
+		if MatchAgentSharedKeyCreds(value[0], value[1], value[2]) {
+			t.Fatalf("accepted %#v", value)
+		}
 	}
 }
 

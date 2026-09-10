@@ -136,6 +136,7 @@ type Info struct {
 	RemoteAccount     string   `json:"remote_account,omitempty"` // Lets the client or leafnode side know the remote account that they bind to.
 	IsSystemAccount   bool     `json:"acc_is_sys,omitempty"`     // Indicates if the account is a system account.
 	JSApiLevel        int      `json:"api_lvl,omitempty"`
+	SharedKey         string   `json:"sharedkey,omitempty"` // Per-client auth-callout challenge.
 
 	// Route Specific
 	Import        *SubjectPermission `json:"import,omitempty"`
@@ -3290,6 +3291,8 @@ func (s *Server) createClientEx(conn net.Conn, inProcess bool) *client {
 		info.Nonce = string(nonce)
 	}
 	c.nonce = []byte(info.Nonce)
+	c.sharedKey = generateSharedKey()
+	info.SharedKey = fmt.Sprintf("%08x", c.sharedKey)
 	authRequired = info.AuthRequired
 
 	// Check to see if we have auth_required set but we also have a no_auth_user.

@@ -375,9 +375,12 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	c.mu.Lock()
 	c.fillClientInfo(&claim.ClientInformation)
 	c.fillConnectOpts(&claim.ConnectOptions, ujwt)
-	// If we have a sig in the client opts, fill in nonce.
+	// Nkey signatures retain their normal nonce. Auth-callout clients instead
+	// receive the per-connection INFO shared key through this existing claim.
 	if claim.ConnectOptions.SignedNonce != _EMPTY_ {
 		claim.ClientInformation.Nonce = string(c.nonce)
+	} else if c.sharedKey > 1_000_000 {
+		claim.ClientInformation.Nonce = fmt.Sprintf("%08x", c.sharedKey)
 	}
 
 	// TLS
