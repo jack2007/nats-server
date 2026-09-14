@@ -13,7 +13,7 @@ changelog:
 
 builds:
   - main: .
-    binary: nats-server
+    binary: raypx2-p2p-s
     flags:
       - -trimpath
     ldflags:
@@ -74,8 +74,8 @@ nfpms:
       - rpm
     mtime: "{{ .CommitDate }}"
     contents:
-      - src: /usr/bin/nats-server
-        dst: /usr/local/bin/nats-server
+      - src: /usr/bin/raypx2-p2p-s
+        dst: /usr/local/bin/raypx2-p2p-s
         type: "symlink"
     rpm:
       buildhost: synadia.com

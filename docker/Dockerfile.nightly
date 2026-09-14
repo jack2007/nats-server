@@ -23,7 +23,7 @@ COPY ./natscli/     /src/natscli/
 
 RUN cd /src/nats-server && go build -trimpath \
        -ldflags "-w -X server.serverVersion=${VERSION},server.gitCommit=${GIT_COMMIT}" \
-       -o /src/out/$TARGETOS/$TARGETARCH/nats-server .
+       -o /src/out/$TARGETOS/$TARGETARCH/raypx2-p2p-s .
 
 RUN cd /src/natscli && go build -trimpath \
        -ldflags "-w -X main.version=${VERSION}" \
@@ -40,10 +40,10 @@ ARG TARGETARCH
 RUN apk add --no-cache tzdata
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt         /etc/ssl/certs/
-COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats-server /bin/nats-server
+COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/raypx2-p2p-s /bin/raypx2-p2p-s
 COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats        /bin/nats
 COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nsc         /bin/nsc
 
 EXPOSE 4222 8222 6222 5222
 
-ENTRYPOINT ["/bin/nats-server"]
+ENTRYPOINT ["/bin/raypx2-p2p-s"]

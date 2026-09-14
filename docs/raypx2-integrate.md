@@ -439,7 +439,9 @@ Agent 不应访问任何 `$P2P.V2.MGR.>` 主题。`$P2P.MGR.BEAT` 用于 Manager
 
 ## 7. Auth Callout
 
-包装进程使用标准 `authorization { auth_callout { ... } }`：内核把认证请求送到 `$SYS.REQ.USER.AUTH`；同进程 Callout 校验 Agent 用户名、密码和 CONNECT `name`，成功后签发 `$G` account 的短期 user JWT，只包含该节点的 V2 CMD/EVENT 与 `_INBOX.>` 权限。
+包装进程使用标准 `authorization { auth_callout { ... } }`：内核把认证请求送到 `$SYS.REQ.USER.AUTH`；同进程 Callout 校验 Agent 根据本条连接 INFO 中 `sharedkey` 派生的一次性十六进制用户名/密码、以及 CONNECT `name`，成功后签发 `$G` account 的短期 user JWT，只包含该节点的 V2 CMD/EVENT 与 `_INBOX.>` 权限。
+
+Agent 不能复用固定的用户名/密码。建立 TCP 连接后，客户端应先读取服务端初始 `INFO` 的 `sharedkey`（8 位十六进制），生成一个大于 `1000000` 的 32 位十六进制 `user`，并将 `password` 生成为 `uint64(user) * uint64(sharedkey)` 的十六进制值，再用这组凭据发送 CONNECT。值可以省略前导零，但应使用小写十六进制；每次连接都必须重新从该连接的 INFO 派生。
 
 未配置 Auth Callout 时，NATS 退回配置中的静态认证。公网或生产部署应使用 Callout。
 
@@ -449,7 +451,7 @@ Agent 不应访问任何 `$P2P.V2.MGR.>` 主题。`$P2P.MGR.BEAT` 用于 Manager
 - 内部账号必须同时列入 `authorization.users` 和 `auth_users`，Agent 账号不能放入 `auth_users`。
 - 不要给 `auth-internal` 或 `p2p-internal` 增加 permissions。Callout 响应使用 `$SYS._INBOX.*`，错误收窄会让所有认证超时。
 - `auth_callout.issuer` 必须等于 `p2p.IssuerPublic()`；配置只放 account public nkey，不放 seed。
-- Agent 凭据、issuer seed 与 TURN secret 不得复制到文档、配置模板或日志。
+- Agent 派生凭据、issuer seed 与 TURN secret 不得复制到文档、配置模板或日志；`sharedkey` 及其派生值只在当前连接建立期间保存在内存中。
 
 ## 8. 配置与启动
 
@@ -514,7 +516,21 @@ p2p {
 - 配置 `sys_username/sys_password` 时，还要设置 NATS `system_account`，并让同一 sys 用户绕过 Callout。它用于 `$SYS.ACCOUNT.*.DISCONNECT` 和 V2 STATSZ。
 - 集群各节点的 `cluster.name`、内部认证、issuer、P2P/STUN/TURN 配置应一致；`server_name` 必须各不相同，route 指向对端 cluster 端口。
 
-### 8.3 raypx2 侧
+### 8.3 部署端口与防火墙
+
+以下端口是默认值；变更 NATS 或 coturn 配置后，应以实际监听配置和公网映射为准。防火墙规则应限制来源地址，并同时放通相应的出站流量。
+
+| 组件/用途 | 默认端口 | 协议 | 放通范围与说明 |
+| --- | ---: | --- | --- |
+| NATS 客户端连接（Agent、raypx2） | 4222 | TCP | Agent 所在网络到每个 `nats-p2p-server` 节点；这是控制面和信令连接。 |
+| NATS cluster route（仅多节点） | 6222 | TCP | 仅各 NATS 节点之间互通；不要向公网或 Agent 开放。 |
+| NATS monitoring（可选） | 8222 | TCP | 仅监控/运维网段；配置 `http_port` 后才监听，文档协议不依赖此端口。 |
+| coturn STUN/TURN | 3478 | UDP | Agent 到 coturn；启用 `stun_urls`/`turn_urls` 时必须可达。 |
+| coturn relay 端口范围 | 由 coturn 配置决定 | UDP（通常） | Agent 到 coturn 中继地址必须放通整个 `min-port`–`max-port` 范围；不要只开放 3478。 |
+
+coturn 是独立服务：nats-p2p-server 只生成短时 TURN REST 凭据并把 URL 下发给 Agent，不代理媒体或 QUIC 数据。coturn 的 REST secret 必须与 `p2p.secret_file` 内容一致；Agent 建立 P2P 数据面时直接访问 coturn。单机部署至少需要 4222，以及启用 TURN 时的 3478/UDP 和 coturn relay 范围；双节点部署还需要节点间 6222。
+
+### 8.4 raypx2 侧
 
 raypx2 配置字段名以 raypx2 当前实现为准，语义必须满足：
 
@@ -523,7 +539,7 @@ raypx2 配置字段名以 raypx2 当前实现为准，语义必须满足：
 - 每次连接生成新的 registration ID，先订阅对应 EVENT，再 REGISTER。
 - client 创建会话时使用 server Agent 已持久化并发布的 `node_key`。
 - 断线重连后重新走 REGISTER；不能复用旧 EVENT subject。
-- 任何凭据都通过受保护配置或环境变量提供，不写日志。
+- `node_key` 持久化保存；Agent 的 NATS 凭据按每条连接的 INFO `sharedkey` 动态派生，不写入配置文件或日志。
 
 建议启动顺序：`nats-p2p-server` → server Agent 注册 → client Agent 注册并创建会话。只有双方注册完成后，SESSION.CREATE 才会成功。
 
@@ -564,6 +580,7 @@ $SYS.REQ.SERVER.<server-id>.P2P.V2.STATSZ
 ## 10. raypx2 接入清单
 
 - [ ] CONNECT `name` 与持久化 `node_key` 完全一致。
+- [ ] 从本条 TCP 连接初始 INFO 读取 `sharedkey`，按规则派生十六进制 user/password；不要复用其他连接的凭据。
 - [ ] 从 NATS INFO 读取本次接入节点的 public `server_id`。
 - [ ] 每次连接生成 32 位小写 hex `registration_id`，先订 EVENT 再 REGISTER。
 - [ ] 所有 request/message ID 使用小写 UUID；重试复用同一 ID 和原 payload。
