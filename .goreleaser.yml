@@ -12,7 +12,7 @@ changelog:
   disable: true
 
 builds:
-  - main: .
+  - main: ./cmd/nats-p2p-server
     binary: raypx2-p2p-s
     flags:
       - -trimpath

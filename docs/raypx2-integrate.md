@@ -2,7 +2,7 @@
 
 本文面向接入 `nats-p2p-server` 的 raypx2 客户端开发者与运维人员，描述当前 P2P V2 控制面、可靠信令、鉴权、集群和监控约定。
 
-实现位于旁路包 `p2p/` 与包装进程 `cmd/nats-p2p-server`，不修改 `server/` 内核。部署时必须启动包装二进制；普通 `nats-server` 不会启动 P2P Coordinator。
+实现位于旁路包 `p2p/` 与包装进程 `cmd/nats-p2p-server`，不修改 `server/` 内核。发布构建产出的包装二进制名为 `raypx2-p2p-s`；部署时必须启动它，普通 `nats-server` 不会启动 P2P Coordinator。
 
 ## 1. 架构与职责边界
 
@@ -458,12 +458,14 @@ Agent 不能复用固定的用户名/密码。建立 TCP 连接后，客户端�
 ### 8.1 启动命令
 
 ```bash
-nats-p2p-server -c conf/nats-p2p-standalone.conf
+raypx2-p2p-s -c conf/nats-p2p-standalone.conf
 
 # 双节点分别启动
-nats-p2p-server -c conf/nats-p2p-dual-a.conf
-nats-p2p-server -c conf/nats-p2p-dual-b.conf
+raypx2-p2p-s -c conf/nats-p2p-dual-a.conf
+raypx2-p2p-s -c conf/nats-p2p-dual-b.conf
 ```
+
+二进制由发布产物提供，也可从源码构建：`go build -o raypx2-p2p-s ./cmd/nats-p2p-server`。
 
 | 文件 | 场景 |
 | --- | --- |

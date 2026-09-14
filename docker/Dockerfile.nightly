@@ -23,7 +23,7 @@ COPY ./natscli/     /src/natscli/
 
 RUN cd /src/nats-server && go build -trimpath \
        -ldflags "-w -X server.serverVersion=${VERSION},server.gitCommit=${GIT_COMMIT}" \
-       -o /src/out/$TARGETOS/$TARGETARCH/raypx2-p2p-s .
+       -o /src/out/$TARGETOS/$TARGETARCH/raypx2-p2p-s ./cmd/nats-p2p-server
 
 RUN cd /src/natscli && go build -trimpath \
        -ldflags "-w -X main.version=${VERSION}" \
